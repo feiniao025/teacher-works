@@ -10,6 +10,7 @@ const advisorRoutes = require('./routes/advisor');
 const statsRoutes = require('./routes/stats');
 const authRoutes = require('./routes/auth');
 const classRoutes = require('./routes/classes');
+const aiGradingRoutes = require('./routes/ai-grading');
 const { authMiddleware } = require('./middleware/auth');
 const { getMainDb, runWithClass } = require('./db');
 
@@ -68,6 +69,7 @@ app.use(API_PREFIX + '/classes', authMiddleware, classRoutes);
 app.use(API_PREFIX, authMiddleware, classContextMiddleware, teacherRoutes);
 app.use(API_PREFIX, authMiddleware, classContextMiddleware, advisorRoutes);
 app.use(API_PREFIX, authMiddleware, classContextMiddleware, statsRoutes);
+app.use(API_PREFIX, authMiddleware, classContextMiddleware, aiGradingRoutes);
 
 // 若前端已构建(dist 存在), 由后端直接托管前端页面,
 // 无需 Nginx 也可通过 http://localhost:3000 直接访问整个系统。

@@ -35,6 +35,45 @@ async function getMainDb() {
   return dbInstance;
 }
 
+// AI 批改任务表 DDL（抽为常量：initClassDb 建表与既有班级库补表共用，避免两处定义漂移）
+// annotated_image_path / ocr_text 为二期（原图标注、本地OCR）预留字段
+const AI_GRADING_TASKS_DDL = `
+  CREATE TABLE IF NOT EXISTS ai_grading_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    exam_id INTEGER,
+    student_id INTEGER,
+    image_path TEXT,
+    status TEXT DEFAULT 'pending',
+    total_score REAL,
+    full_score REAL,
+    comment TEXT,
+    detail TEXT,
+    model TEXT,
+    error TEXT,
+    adopted INTEGER DEFAULT 0,
+    adopted_at DATETIME,
+    annotated_image_path TEXT,
+    ocr_text TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (exam_id) REFERENCES exams(id),
+    FOREIGN KEY (student_id) REFERENCES students(id)
+  );
+`;
+
+// 确保 AI 批改 schema 就绪并复位遗留任务（幂等，每库进程内一次性执行）：
+//  1. 补建 ai_grading_tasks 表——兼容本次升级前已创建、不含该表的既有班级库，
+//     否则非默认班级的 AI 接口会因 no such table 全部失败；
+//  2. 将上次进程遗留的 pending/processing 任务复位为 failed——后台批改是内存态
+//     fire-and-forget，进程重启后这些任务不会再推进，复位可避免前端无限轮询。
+// 调用点：initClassDb（主库/新建班级）与 getDb 首次打开既有班级库连接。
+async function ensureAiGradingSchema(db) {
+  await db.exec(AI_GRADING_TASKS_DDL);
+  await db.run(
+    "UPDATE ai_grading_tasks SET status='failed', error='服务重启导致批改中断，请重新发起', updated_at=CURRENT_TIMESTAMP WHERE status IN ('pending','processing')"
+  );
+}
+
 // 获取当前请求上下文的班级库连接：
 // 1. 无班级上下文（启动阶段/健康检查等）或默认班级 -> 主库
 // 2. 有上下文 -> 对应班级库文件（按文件路径缓存连接）
@@ -50,6 +89,8 @@ async function getDb() {
     filename: path.join(classDbDir, ctx.dbFile),
     driver: sqlite3.Database
   });
+  // 既有班级库首次打开：补齐本次升级新增的表并复位遗留 AI 任务（幂等，仅进程内首次）
+  await ensureAiGradingSchema(conn);
   classDbCache.set(ctx.dbFile, conn);
   return conn;
 }
@@ -57,6 +98,12 @@ async function getDb() {
 // 班级中间件调用：把当前请求绑定到指定班级库
 function runWithClass(ctx, next) {
   classContext.run(ctx, next);
+}
+
+// 读取当前请求的班级上下文（供后台异步任务捕获并在脱离请求后透传，
+// 例如 AI 批改任务在后台执行时仍需在正确的班级库读写数据）
+function getClassContext() {
+  return classContext.getStore();
 }
 
 // 从连接缓存移除并关闭班级连接（删除班级时使用）
@@ -452,6 +499,10 @@ async function initClassDb(db) {
     }
   }
 
+  // AI 批改任务表统一由 ensureAiGradingSchema 建表并复位遗留任务
+  // （主库/新建班级走此处；升级前已存在的班级库在 getDb 首次打开时补建）
+  await ensureAiGradingSchema(db);
+
   console.log('Database initialized and tables created/verified.');
 }
 
@@ -461,6 +512,7 @@ module.exports = {
   initDb,
   initClassDb,
   runWithClass,
+  getClassContext,
   closeClassDb,
   classDbPath
 };

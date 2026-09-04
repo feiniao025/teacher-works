@@ -30,6 +30,10 @@
             <el-icon><Document /></el-icon>
             <span>试卷管理</span>
           </el-menu-item>
+          <el-menu-item index="/teacher/ai-grading">
+            <el-icon><MagicStick /></el-icon>
+            <span>AI 批改</span>
+          </el-menu-item>
           <el-menu-item index="/teacher/recitations">
             <el-icon><Reading /></el-icon>
             <span>背书情况</span>

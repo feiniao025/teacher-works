@@ -1,0 +1,808 @@
+<template>
+  <div class="ai-grading">
+    <!-- 顶部：功能状态 + 配置入口 -->
+    <el-card shadow="never" class="mb-16">
+      <div class="topbar">
+        <div class="topbar-left">
+          <span class="page-name">AI 试卷批改</span>
+          <el-tag v-if="aiEnabled" type="success" size="small" effect="dark">已开启</el-tag>
+          <el-tag v-else type="info" size="small">未开启</el-tag>
+          <span class="model-info" v-if="configSummary">
+            <el-icon><Cpu /></el-icon>{{ configSummary }}
+          </span>
+        </div>
+        <el-button type="primary" plain @click="openConfig">
+          <el-icon><Setting /></el-icon>模型配置
+        </el-button>
+      </div>
+      <el-alert
+        v-if="!aiEnabled"
+        type="warning"
+        :closable="false"
+        show-icon
+        style="margin-top: 12px"
+        title="AI 批改功能尚未开启"
+        description="点击右上角「模型配置」，开启功能并添加至少一个多模态模型供应商（默认 DeepSeek，可添加多个并切换）的服务地址与密钥后即可使用。"
+      />
+      <el-alert
+        v-else
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin-top: 12px"
+        title="AI 为辅助批改，识别与判分可能存在误差，请老师核对后再「采纳到成绩」。"
+      />
+    </el-card>
+
+    <!-- 发起批改 -->
+    <el-card shadow="never" class="mb-16">
+      <template #header><span class="card-title">发起 AI 批改</span></template>
+      <el-form :inline="true" class="start-form">
+        <el-form-item label="试卷">
+          <el-select v-model="newForm.exam_id" placeholder="选择试卷" filterable style="width: 260px">
+            <el-option v-for="e in exams" :key="e.id" :label="e.title" :value="e.id">
+              <span>{{ e.title }}</span>
+              <el-tag v-if="e.subject" size="small" type="warning" style="margin-left: 6px">{{ e.subject }}</el-tag>
+            </el-option>
+          </el-select>
+        </el-form-item>
+        <el-form-item label="学生">
+          <el-select v-model="newForm.student_id" placeholder="选择学生" filterable style="width: 180px">
+            <el-option v-for="s in students" :key="s.id" :label="s.name" :value="s.id" />
+          </el-select>
+        </el-form-item>
+      </el-form>
+
+      <el-upload
+        ref="uploadRef"
+        :auto-upload="false"
+        :limit="6"
+        accept="image/*"
+        multiple
+        list-type="picture-card"
+        :on-change="onImageChange"
+        :on-remove="onImageChange"
+      >
+        <el-icon><Plus /></el-icon>
+      </el-upload>
+      <div class="form-tip">
+        上传该学生的试卷照片（可多张，越清晰越准）。若不上传，将自动使用其在「试卷管理 → 考试记录」中已有的试卷照片。
+      </div>
+      <div style="margin-top: 14px">
+        <el-button type="primary" :loading="starting" :disabled="!aiEnabled" @click="startGrading">
+          <el-icon><MagicStick /></el-icon>开始批改
+        </el-button>
+        <span v-if="!aiEnabled" class="form-tip" style="margin-left: 10px">请先开启并配置 AI 功能</span>
+      </div>
+    </el-card>
+
+    <!-- 批改记录 -->
+    <el-card shadow="never">
+      <template #header>
+        <div class="card-title-row">
+          <span class="card-title">批改记录</span>
+          <el-button size="small" text type="primary" @click="loadTasks()">
+            <el-icon><Refresh /></el-icon>刷新
+          </el-button>
+        </div>
+      </template>
+      <el-table :data="tasks" v-loading="tasksLoading" style="width: 100%" empty-text="暂无批改记录">
+        <el-table-column prop="student_name" label="学生" width="100" />
+        <el-table-column prop="exam_title" label="试卷" min-width="160" show-overflow-tooltip />
+        <el-table-column label="状态" width="110">
+          <template #default="{ row }">
+            <el-tag :type="statusTag(row.status).type" size="small">
+              <el-icon v-if="row.status === 'processing'" class="is-loading"><Loading /></el-icon>
+              {{ statusTag(row.status).label }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="AI 判分" width="110">
+          <template #default="{ row }">
+            <span v-if="row.status === 'success'" :class="scoreClass(row.total_score, row.full_score)">
+              {{ row.total_score }}<span class="full">/ {{ row.full_score }}</span>
+            </span>
+            <span v-else class="text-muted">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="采纳" width="80" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.adopted" type="success" size="small">已采纳</el-tag>
+            <span v-else class="text-muted">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="model" label="模型" width="150" show-overflow-tooltip />
+        <el-table-column prop="created_at" label="批改时间" width="170" />
+        <el-table-column label="操作" width="220" fixed="right">
+          <template #default="{ row }">
+            <el-button link type="primary" size="small" @click="viewDetail(row)">查看</el-button>
+            <el-button
+              v-if="row.status === 'success'"
+              link type="success" size="small"
+              @click="openAdopt(row)"
+            >采纳</el-button>
+            <el-button
+              v-if="row.status === 'success'"
+              link type="warning" size="small"
+              @click="exportDoc(row)"
+            >导出</el-button>
+            <el-popconfirm title="确定删除该批改记录？" @confirm="removeTask(row)">
+              <template #reference>
+                <el-button link type="danger" size="small">删除</el-button>
+              </template>
+            </el-popconfirm>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
+    <!-- 批改详情对话框 -->
+    <el-dialog v-model="detailVisible" title="批改详情" width="960px" top="6vh" @closed="stopDetailPolling">
+      <div v-if="currentTask" class="detail-wrap">
+        <div class="detail-head">
+          <div class="detail-head-item">
+            <span class="label">学生</span><span class="value">{{ currentTask.student_name }}</span>
+          </div>
+          <div class="detail-head-item">
+            <span class="label">试卷</span><span class="value">{{ currentTask.exam_title }}</span>
+          </div>
+          <div class="detail-head-item">
+            <span class="label">模型</span><span class="value">{{ currentTask.model }}</span>
+          </div>
+          <div class="detail-head-item score-box">
+            <span class="label">AI 判分</span>
+            <span class="value big" :class="scoreClass(currentTask.total_score, currentTask.full_score)">
+              {{ currentTask.status === 'success' ? currentTask.total_score : '—' }}
+              <span class="full" v-if="currentTask.status === 'success'">/ {{ currentTask.full_score }}</span>
+            </span>
+          </div>
+        </div>
+
+        <el-alert
+          v-if="currentTask.status === 'processing' || currentTask.status === 'pending'"
+          type="info" :closable="false" show-icon title="AI 正在批改中，请稍候…" style="margin-bottom: 12px"
+        />
+        <el-alert
+          v-else-if="currentTask.status === 'failed'"
+          type="error" :closable="false" show-icon
+          :title="'批改失败：' + (currentTask.error || '未知错误')" style="margin-bottom: 12px"
+        />
+
+        <template v-if="currentTask.status === 'success'">
+          <el-alert
+            v-if="currentTask.comment"
+            type="success" :closable="false" show-icon
+            :title="'总评：' + currentTask.comment" style="margin-bottom: 12px"
+          />
+          <div class="detail-body">
+            <div class="detail-left">
+              <div class="section-title">试卷原图</div>
+              <div class="img-list">
+                <el-image
+                  v-for="(img, i) in taskImages(currentTask)" :key="img"
+                  class="detail-img"
+                  :src="`/uploads/${img}`"
+                  :preview-src-list="taskImages(currentTask).map(x => `/uploads/${x}`)"
+                  :initial-index="i"
+                  fit="contain"
+                  preview-teleported
+                />
+              </div>
+            </div>
+            <div class="detail-right">
+              <div class="section-title">逐题批改（{{ detailQuestions.length }} 题）</div>
+              <div class="q-list">
+                <div v-for="(q, i) in detailQuestions" :key="i" class="q-item" :class="'q-' + q.result">
+                  <div class="q-head">
+                    <span class="q-no">第 {{ q.no }} 题</span>
+                    <el-tag :type="resultTag(q.result).type" size="small">{{ resultTag(q.result).label }}</el-tag>
+                    <span class="q-score">{{ q.score }} / {{ q.full_score }}</span>
+                  </div>
+                  <div class="q-row" v-if="q.question"><span class="q-label">题目</span>{{ q.question }}</div>
+                  <div class="q-row" v-if="q.student_answer"><span class="q-label">作答</span>{{ q.student_answer }}</div>
+                  <div class="q-row q-comment" v-if="q.comment"><span class="q-label">点评</span>{{ q.comment }}</div>
+                </div>
+                <el-empty v-if="!detailQuestions.length" description="模型未返回逐题明细" :image-size="60" />
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
+      <template #footer>
+        <el-button @click="detailVisible = false">关闭</el-button>
+        <el-button v-if="currentTask && currentTask.status === 'success'" type="warning" plain @click="exportDoc(currentTask)">
+          <el-icon><Download /></el-icon>导出批改文档
+        </el-button>
+        <el-button v-if="currentTask && currentTask.status === 'success'" type="success" @click="openAdopt(currentTask)">
+          <el-icon><Select /></el-icon>采纳到成绩
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 采纳成绩对话框 -->
+    <el-dialog v-model="adoptVisible" title="采纳到成绩" width="480px">
+      <el-alert
+        type="info" :closable="false" show-icon style="margin-bottom: 14px"
+        title="采纳后将写入该生的考试记录，并自动同步到「成绩分析」。请核对分数。"
+      />
+      <el-form label-width="90px">
+        <el-form-item label="AI 判分">
+          <span class="adopt-ai">{{ adoptForm.aiTotal }} / {{ adoptForm.aiFull }}</span>
+          <el-button v-if="needConvert" link type="primary" size="small" @click="convertTo100">按百分制换算</el-button>
+        </el-form-item>
+        <el-form-item label="写入成绩">
+          <el-input-number v-model="adoptForm.score" :min="0" :max="999" :precision="1" style="width: 100%" />
+          <div class="form-tip">默认填入 AI 判定的卷面原始分（与手工录入口径一致）；若成绩分析统一按百分制，可点上方「按百分制换算」。</div>
+        </el-form-item>
+        <el-form-item label="评语">
+          <el-input type="textarea" :rows="3" v-model="adoptForm.comment" placeholder="写入考试记录的评语" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="adoptVisible = false">取消</el-button>
+        <el-button type="primary" :loading="adopting" @click="submitAdopt">确定采纳</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 模型配置对话框：总开关 + 多供应商管理 -->
+    <el-dialog v-model="configVisible" title="AI 模型配置" width="760px" top="6vh">
+      <div class="cfg-enabled">
+        <span class="cfg-enabled-label">启用 AI 批改</span>
+        <el-switch v-model="aiEnabledForm" />
+        <span class="form-tip" style="margin-left: 10px">关闭后隐藏批改能力，不影响其它功能</span>
+      </div>
+
+      <div class="cfg-providers-head">
+        <span class="section-title">模型供应商（可添加多个，切换使用）</span>
+        <el-button size="small" type="primary" plain @click="openAddProvider">
+          <el-icon><Plus /></el-icon>添加供应商
+        </el-button>
+      </div>
+
+      <el-table :data="aiInfo.providers" size="small" style="width: 100%" empty-text="尚未添加供应商，点击右上角「添加供应商」">
+        <el-table-column label="当前使用" width="100" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.id === aiInfo.active_id" type="success" size="small" effect="dark">使用中</el-tag>
+            <el-button v-else link type="primary" size="small" @click="activateProvider(row)">设为当前</el-button>
+          </template>
+        </el-table-column>
+        <el-table-column prop="name" label="名称" min-width="110" show-overflow-tooltip />
+        <el-table-column prop="model" label="模型" min-width="140" show-overflow-tooltip />
+        <el-table-column prop="base_url" label="服务地址" min-width="180" show-overflow-tooltip />
+        <el-table-column label="密钥" width="90" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.api_key_set" size="small" type="info">{{ row.api_key_masked }}</el-tag>
+            <span v-else class="text-muted">无</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="150" fixed="right">
+          <template #default="{ row }">
+            <el-button link type="primary" size="small" @click="testSavedProvider(row)">测试</el-button>
+            <el-button link type="primary" size="small" @click="openEditProvider(row)">编辑</el-button>
+            <el-popconfirm title="确定删除该供应商？" @confirm="removeProvider(row)">
+              <template #reference>
+                <el-button link type="danger" size="small">删除</el-button>
+              </template>
+            </el-popconfirm>
+          </template>
+        </el-table-column>
+      </el-table>
+      <div class="form-tip">「当前使用」为批改时实际调用的供应商，点「设为当前」即时切换；密钥仅存服务端并掩码显示，不下发浏览器。</div>
+
+      <template #footer>
+        <el-button @click="configVisible = false">关闭</el-button>
+        <el-button type="primary" :loading="savingConfig" @click="saveConfig">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 供应商编辑子对话框（新增 / 编辑） -->
+    <el-dialog
+      v-model="providerVisible"
+      :title="editingProviderId ? '编辑供应商' : '添加供应商'"
+      width="600px" top="8vh" append-to-body
+    >
+      <el-form :model="providerForm" label-width="100px">
+        <el-form-item label="快捷预设">
+          <el-select v-model="providerForm.provider" style="width: 100%" @change="onProviderPresetChange">
+            <el-option v-for="p in presets" :key="p.key" :label="p.label" :value="p.key" />
+          </el-select>
+          <div class="form-tip" v-if="currentHint">{{ currentHint }}</div>
+        </el-form-item>
+        <el-form-item label="供应商名称">
+          <el-input v-model="providerForm.name" placeholder="便于识别的名称，如 DeepSeek 官方 / 内网中转" />
+        </el-form-item>
+        <el-form-item label="服务地址">
+          <el-input v-model="providerForm.base_url" placeholder="如 https://api.deepseek.com" />
+          <div class="form-tip">OpenAI 兼容 base_url，系统会自动拼接 /chat/completions</div>
+        </el-form-item>
+        <el-form-item label="API Key">
+          <el-input
+            v-model="providerForm.api_key"
+            type="password"
+            show-password
+            :placeholder="providerForm.api_key_set ? `已配置 ${providerForm.api_key_masked}，留空则不修改` : '请输入 API Key（本地模型可留空）'"
+          />
+        </el-form-item>
+        <el-form-item label="模型名称">
+          <el-input v-model="providerForm.model" placeholder="如 deepseek-v4-flash-vision-exp / qwen-vl-max" />
+        </el-form-item>
+        <el-form-item label="多模态">
+          <el-switch v-model="providerForm.multimodal" />
+          <span class="form-tip" style="margin-left: 10px">批改试卷需读取图片，请保持开启</span>
+        </el-form-item>
+        <el-form-item label="温度">
+          <el-input-number v-model="providerForm.temperature" :min="0" :max="2" :step="0.1" :precision="1" />
+          <span class="form-tip" style="margin-left: 10px">越低越稳定，批改建议 0~0.3</span>
+        </el-form-item>
+        <el-form-item label="最大 Tokens">
+          <el-input-number v-model="providerForm.max_tokens" :min="256" :max="16000" :step="256" />
+        </el-form-item>
+        <el-form-item label="系统提示词">
+          <el-input
+            type="textarea" :rows="5" v-model="providerForm.system_prompt"
+            placeholder="留空则使用内置批改提示词"
+          />
+          <el-button link type="primary" size="small" @click="restoreDefaultPrompt">恢复默认提示词</el-button>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button :loading="testing" @click="testConn">
+          <el-icon><Connection /></el-icon>测试连接
+        </el-button>
+        <el-button @click="providerVisible = false">取消</el-button>
+        <el-button type="primary" :loading="providerSaving" @click="saveProvider">保存供应商</el-button>
+      </template>
+    </el-dialog>
+  </div>
+</template>
+
+<script setup>
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ElMessage } from 'element-plus'
+import {
+  getAiPresets, getAiConfig, saveAiConfig, testAiConnection,
+  addAiProvider, updateAiProvider, deleteAiProvider, activateAiProvider, testAiProvider,
+  getAiTasks, createAiTask, getAiTask, adoptAiTask, deleteAiTask, exportAiTask,
+  getExams, getStudents
+} from '../../api'
+
+// ---------- 状态 ----------
+const aiInfo = ref({ enabled: false, providers: [], active_id: '' })
+const presets = ref([])
+const defaultPrompt = ref('')
+const exams = ref([])
+const students = ref([])
+const tasks = ref([])
+const tasksLoading = ref(false)
+const starting = ref(false)
+
+const aiEnabled = computed(() => aiInfo.value.enabled)
+// 当前使用的供应商（激活项），顶部状态栏与批改均以此为准
+const activeProvider = computed(() =>
+  (aiInfo.value.providers || []).find(p => p.id === aiInfo.value.active_id) || null
+)
+const configSummary = computed(() => {
+  const a = activeProvider.value
+  if (!a) return '未配置供应商'
+  return `${a.name}${a.model ? ' · ' + a.model : ''}`
+})
+
+// ---------- 发起批改 ----------
+const newForm = ref({ exam_id: null, student_id: null })
+const uploadRef = ref()
+const imageFiles = ref([])
+
+const onImageChange = (file, uploadFiles) => {
+  imageFiles.value = (uploadFiles || []).map(f => f.raw).filter(Boolean)
+}
+
+const startGrading = async () => {
+  if (!newForm.value.exam_id) return ElMessage.warning('请选择试卷')
+  if (!newForm.value.student_id) return ElMessage.warning('请选择学生')
+  starting.value = true
+  try {
+    const fd = new FormData()
+    fd.append('exam_id', newForm.value.exam_id)
+    fd.append('student_id', newForm.value.student_id)
+    imageFiles.value.forEach(f => fd.append('images', f))
+    const r = await createAiTask(fd)
+    ElMessage.success('已提交批改，AI 正在处理…')
+    uploadRef.value?.clearFiles()
+    imageFiles.value = []
+    await loadTasks()
+    // 打开详情并轮询进度
+    const created = tasks.value.find(t => t.id === r.id)
+    if (created) viewDetail(created)
+    startPolling()
+  } catch (e) {
+    // 拦截器已提示
+  } finally {
+    starting.value = false
+  }
+}
+
+// ---------- 任务列表与轮询 ----------
+const notified = new Set()
+let pollTimer = null
+
+const loadTasks = async (silent = false) => {
+  if (!silent) tasksLoading.value = true
+  try {
+    const before = new Map(tasks.value.map(t => [t.id, t.status]))
+    const rows = await getAiTasks({})
+    tasks.value = rows || []
+    // 新完成的批改给出一次提示
+    tasks.value.forEach(t => {
+      if (t.status === 'success' && before.get(t.id) && before.get(t.id) !== 'success' && !notified.has(t.id)) {
+        notified.add(t.id)
+        ElMessage.success(`${t.student_name} 的试卷批改完成`)
+      }
+      if (t.status === 'failed' && before.get(t.id) && before.get(t.id) !== 'failed' && !notified.has('f' + t.id)) {
+        notified.add('f' + t.id)
+        ElMessage.error(`${t.student_name} 的试卷批改失败`)
+      }
+    })
+  } catch (e) {
+    // 拦截器已提示
+  } finally {
+    tasksLoading.value = false
+  }
+}
+
+const startPolling = () => {
+  if (pollTimer) return
+  pollTimer = setInterval(() => {
+    const hasPending = tasks.value.some(t => t.status === 'pending' || t.status === 'processing')
+    if (hasPending) loadTasks(true)
+    else stopPolling()
+  }, 2500)
+}
+const stopPolling = () => {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+}
+
+// ---------- 详情 ----------
+const detailVisible = ref(false)
+const currentTask = ref(null)
+let detailTimer = null
+
+const detailQuestions = computed(() => {
+  const d = currentTask.value?.detail
+  return d && Array.isArray(d.questions) ? d.questions : []
+})
+const taskImages = (t) => (t && t.image_path ? t.image_path.split(',').filter(Boolean) : [])
+
+const viewDetail = async (row) => {
+  detailVisible.value = true
+  await refreshDetail(row.id)
+  if (currentTask.value && ['pending', 'processing'].includes(currentTask.value.status)) {
+    startDetailPolling(row.id)
+  }
+}
+const refreshDetail = async (id) => {
+  try {
+    currentTask.value = await getAiTask(id)
+  } catch (e) { /* 拦截器已提示 */ }
+}
+const startDetailPolling = (id) => {
+  stopDetailPolling()
+  detailTimer = setInterval(async () => {
+    await refreshDetail(id)
+    const st = currentTask.value?.status
+    if (st && !['pending', 'processing'].includes(st)) {
+      stopDetailPolling()
+      loadTasks(true)
+    }
+  }, 2500)
+}
+const stopDetailPolling = () => {
+  if (detailTimer) { clearInterval(detailTimer); detailTimer = null }
+}
+
+// ---------- 采纳 ----------
+const adoptVisible = ref(false)
+const adopting = ref(false)
+const adoptForm = ref({ id: null, score: 0, comment: '', aiTotal: 0, aiFull: 0 })
+const needConvert = computed(() => {
+  const f = Number(adoptForm.value.aiFull)
+  return f && f !== 100
+})
+
+// 默认写入卷面原始分，与「考试记录」手工录入 / Excel 导入口径一致，避免同一考试下
+// 成绩分析混入百分制换算分导致均分/趋势失真；满分非 100 时老师可显式点击换算按钮
+const defaultAdoptScore = (task) => Math.round(Number(task.total_score || 0) * 10) / 10
+const openAdopt = (task) => {
+  adoptForm.value = {
+    id: task.id,
+    score: defaultAdoptScore(task),
+    comment: task.comment || '',
+    aiTotal: task.total_score,
+    aiFull: task.full_score
+  }
+  adoptVisible.value = true
+}
+const convertTo100 = () => {
+  const total = Number(adoptForm.value.aiTotal || 0)
+  const full = Number(adoptForm.value.aiFull || 0)
+  if (full) adoptForm.value.score = Math.round((total / full) * 100 * 10) / 10
+}
+const submitAdopt = async () => {
+  adopting.value = true
+  try {
+    await adoptAiTask(adoptForm.value.id, { score: adoptForm.value.score, comment: adoptForm.value.comment })
+    ElMessage.success('已采纳并同步到成绩分析')
+    adoptVisible.value = false
+    await loadTasks(true)
+    if (currentTask.value && currentTask.value.id === adoptForm.value.id) {
+      await refreshDetail(currentTask.value.id)
+    }
+  } catch (e) {
+    // 拦截器已提示
+  } finally {
+    adopting.value = false
+  }
+}
+
+// ---------- 导出 / 删除 ----------
+const exportDoc = async (task) => {
+  try {
+    const blob = await exportAiTask(task.id)
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${task.exam_title || '试卷'}_${task.student_name || '学生'}_AI批改.xlsx`
+    a.click()
+    URL.revokeObjectURL(url)
+    ElMessage.success('批改文档已导出')
+  } catch (e) { /* 拦截器已提示 */ }
+}
+const removeTask = async (task) => {
+  try {
+    await deleteAiTask(task.id)
+    ElMessage.success('已删除')
+    if (currentTask.value && currentTask.value.id === task.id) detailVisible.value = false
+    await loadTasks(true)
+  } catch (e) { /* 拦截器已提示 */ }
+}
+
+// ---------- 配置：总开关 + 多供应商管理 ----------
+const configVisible = ref(false)
+const savingConfig = ref(false)
+const aiEnabledForm = ref(false)
+
+// 供应商编辑子弹窗
+const providerVisible = ref(false)
+const providerSaving = ref(false)
+const testing = ref(false)
+const providerForm = ref({})
+const editingProviderId = ref(null) // null = 新增
+const currentHint = computed(() => {
+  const p = presets.value.find(x => x.key === providerForm.value.provider)
+  return p ? p.hint : ''
+})
+// 预设显示名去掉「（默认）/（官方）」等后缀，作为供应商名默认值
+const presetShortName = (label) => String(label || '').replace(/（.*?）/g, '').trim()
+
+const loadConfig = async () => {
+  try { aiInfo.value = await getAiConfig() } catch (e) { /* 拦截器已提示 */ }
+}
+const openConfig = async () => {
+  await loadConfig()
+  aiEnabledForm.value = !!aiInfo.value.enabled
+  configVisible.value = true
+}
+// 保存总开关（当前激活供应商在切换时已即时保存）
+const saveConfig = async () => {
+  savingConfig.value = true
+  try {
+    await saveAiConfig({ enabled: aiEnabledForm.value, active_id: aiInfo.value.active_id })
+    ElMessage.success('已保存')
+    configVisible.value = false
+    await loadConfig()
+  } catch (e) { /* 拦截器已提示 */ } finally {
+    savingConfig.value = false
+  }
+}
+// 切换当前使用的供应商
+const activateProvider = async (p) => {
+  try {
+    await activateAiProvider(p.id)
+    ElMessage.success(`已切换到「${p.name}」`)
+    await loadConfig()
+  } catch (e) { /* 拦截器已提示 */ }
+}
+// 新增供应商：默认预选首个预设（DeepSeek）
+const openAddProvider = () => {
+  editingProviderId.value = null
+  const preset = presets.value[0] || {}
+  providerForm.value = {
+    name: presetShortName(preset.label),
+    provider: preset.key || 'deepseek',
+    base_url: preset.base_url || '',
+    api_key: '',
+    api_key_set: false,
+    api_key_masked: '',
+    model: preset.model || '',
+    multimodal: preset.multimodal !== false,
+    temperature: 0.1,
+    max_tokens: 3000,
+    system_prompt: ''
+  }
+  providerVisible.value = true
+}
+// 编辑供应商：apiKey 不回显明文，留空则保留原值
+const openEditProvider = (p) => {
+  editingProviderId.value = p.id
+  providerForm.value = {
+    id: p.id,
+    name: p.name || '',
+    provider: p.provider || 'custom',
+    base_url: p.base_url || '',
+    api_key: '',
+    api_key_set: p.api_key_set,
+    api_key_masked: p.api_key_masked,
+    model: p.model || '',
+    multimodal: p.multimodal !== false,
+    temperature: p.temperature ?? 0.1,
+    max_tokens: p.max_tokens || 3000,
+    system_prompt: p.system_prompt || ''
+  }
+  providerVisible.value = true
+}
+// 选择预设快捷回填 base_url / model
+const onProviderPresetChange = (key) => {
+  const p = presets.value.find(x => x.key === key)
+  if (p) {
+    providerForm.value.base_url = p.base_url
+    providerForm.value.model = p.model
+    providerForm.value.multimodal = p.multimodal
+    if (!providerForm.value.name) providerForm.value.name = presetShortName(p.label)
+  }
+}
+const restoreDefaultPrompt = () => {
+  providerForm.value.system_prompt = defaultPrompt.value
+}
+// 保存供应商（新增 / 编辑）
+const saveProvider = async () => {
+  if (!providerForm.value.base_url || !providerForm.value.model) {
+    return ElMessage.warning('请填写服务地址（base_url）与模型名（model）')
+  }
+  providerSaving.value = true
+  try {
+    if (editingProviderId.value) {
+      await updateAiProvider(editingProviderId.value, providerForm.value)
+      ElMessage.success('供应商已更新')
+    } else {
+      await addAiProvider(providerForm.value)
+      ElMessage.success('供应商已添加')
+    }
+    providerVisible.value = false
+    await loadConfig()
+  } catch (e) { /* 拦截器已提示 */ } finally {
+    providerSaving.value = false
+  }
+}
+// 测试编辑中（未保存）的配置
+const testConn = async () => {
+  if (!providerForm.value.base_url || !providerForm.value.model) {
+    return ElMessage.warning('请先填写服务地址与模型名')
+  }
+  testing.value = true
+  try {
+    const payload = { ...providerForm.value }
+    if (editingProviderId.value) payload.provider_id = editingProviderId.value
+    const r = await testAiConnection(payload)
+    ElMessage.success('连接成功' + (r && r.reply ? `：${r.reply}` : ''))
+  } catch (e) { /* 拦截器已提示 */ } finally {
+    testing.value = false
+  }
+}
+// 测试已保存供应商
+const testSavedProvider = async (p) => {
+  try {
+    const r = await testAiProvider(p.id)
+    ElMessage.success(`「${p.name}」连接成功` + (r && r.reply ? `：${r.reply}` : ''))
+  } catch (e) { /* 拦截器已提示 */ }
+}
+// 删除供应商
+const removeProvider = async (p) => {
+  try {
+    await deleteAiProvider(p.id)
+    ElMessage.success('供应商已删除')
+    await loadConfig()
+  } catch (e) { /* 拦截器已提示 */ }
+}
+
+// ---------- 展示辅助 ----------
+const statusTag = (s) => ({
+  pending: { type: 'info', label: '等待中' },
+  processing: { type: 'warning', label: '批改中' },
+  success: { type: 'success', label: '已完成' },
+  failed: { type: 'danger', label: '失败' }
+}[s] || { type: 'info', label: s })
+
+const resultTag = (r) => ({
+  correct: { type: 'success', label: '✓ 正确' },
+  wrong: { type: 'danger', label: '✗ 错误' },
+  partial: { type: 'warning', label: '◐ 部分正确' },
+  blank: { type: 'info', label: '— 未作答' },
+  unknown: { type: 'info', label: '? 待判定' }
+}[r] || { type: 'info', label: '? 待判定' })
+
+const scoreClass = (score, full) => {
+  if (score === null || score === undefined) return ''
+  const f = Number(full) || 100
+  const ratio = Number(score) / f
+  if (ratio >= 0.9) return 'score-good'
+  if (ratio >= 0.8) return 'score-mid'
+  if (ratio >= 0.6) return 'score-ok'
+  return 'score-bad'
+}
+
+// ---------- 初始化 ----------
+onMounted(async () => {
+  try {
+    const p = await getAiPresets()
+    presets.value = p.presets || []
+    defaultPrompt.value = p.default_system_prompt || ''
+  } catch (e) { /* 拦截器已提示 */ }
+  loadConfig()
+  try { exams.value = await getExams() } catch (e) { /* ignore */ }
+  try { students.value = await getStudents() } catch (e) { /* ignore */ }
+  await loadTasks()
+  if (tasks.value.some(t => t.status === 'pending' || t.status === 'processing')) startPolling()
+})
+onBeforeUnmount(() => {
+  stopPolling()
+  stopDetailPolling()
+})
+</script>
+
+<style scoped>
+.mb-16 { margin-bottom: 16px; }
+.cfg-enabled { display: flex; align-items: center; margin-bottom: 16px; }
+.cfg-enabled-label { font-size: 14px; font-weight: 600; color: #303133; margin-right: 12px; }
+.cfg-providers-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.topbar { display: flex; justify-content: space-between; align-items: center; }
+.topbar-left { display: flex; align-items: center; gap: 10px; }
+.page-name { font-size: 16px; font-weight: 600; color: #303133; }
+.model-info { display: flex; align-items: center; gap: 4px; font-size: 13px; color: #909399; }
+.card-title { font-weight: 600; }
+.card-title-row { display: flex; justify-content: space-between; align-items: center; }
+.start-form { margin-bottom: 4px; }
+.form-tip { font-size: 12px; color: #909399; margin-top: 6px; line-height: 1.6; }
+.text-muted { color: #c0c4cc; }
+.full { color: #909399; font-size: 12px; }
+
+.score-good { color: #67c23a; font-weight: 600; }
+.score-mid { color: #409eff; font-weight: 600; }
+.score-ok { color: #e6a23c; font-weight: 600; }
+.score-bad { color: #f56c6c; font-weight: 600; }
+
+.detail-wrap { max-height: 66vh; overflow: auto; }
+.detail-head { display: flex; flex-wrap: wrap; gap: 24px; padding-bottom: 12px; border-bottom: 1px solid #f0f0f0; margin-bottom: 12px; }
+.detail-head-item { display: flex; flex-direction: column; gap: 4px; }
+.detail-head-item .label { font-size: 12px; color: #909399; }
+.detail-head-item .value { font-size: 14px; color: #303133; }
+.detail-head-item .value.big { font-size: 24px; }
+.detail-body { display: flex; gap: 16px; }
+.detail-left { width: 320px; flex-shrink: 0; }
+.detail-right { flex: 1; min-width: 0; }
+.section-title { font-size: 13px; font-weight: 600; color: #606266; margin-bottom: 8px; }
+.img-list { display: flex; flex-direction: column; gap: 10px; }
+.detail-img { width: 100%; max-height: 360px; border: 1px solid #ebeef5; border-radius: 6px; background: #fafafa; }
+
+.q-list { display: flex; flex-direction: column; gap: 8px; }
+.q-item { border: 1px solid #ebeef5; border-left: 3px solid #dcdfe6; border-radius: 6px; padding: 8px 12px; background: #fff; }
+.q-item.q-correct { border-left-color: #67c23a; }
+.q-item.q-wrong { border-left-color: #f56c6c; }
+.q-item.q-partial { border-left-color: #e6a23c; }
+.q-item.q-blank { border-left-color: #909399; }
+.q-head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+.q-no { font-weight: 600; color: #303133; }
+.q-score { margin-left: auto; font-weight: 600; color: #409eff; }
+.q-row { font-size: 13px; color: #606266; line-height: 1.7; word-break: break-word; }
+.q-label { display: inline-block; min-width: 34px; color: #909399; margin-right: 6px; }
+.q-comment { color: #e6a23c; }
+.adopt-ai { font-weight: 600; color: #409eff; margin-right: 12px; }
+</style>

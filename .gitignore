@@ -5,9 +5,13 @@ frontend/dist/
 frontend/node_modules/
 backend/node_modules/
 backend/database.sqlite
+# 多班级：每班独立数据库(含真实学生数据)，与主库一样不入库
+backend/class-*.sqlite
 backend/uploads/
 .DS_Store
 *.log
+# release 说明草稿(本地临时文件)
+.release-body.tmp.md
 
 # 构建产物
 release/

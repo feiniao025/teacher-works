@@ -156,3 +156,25 @@ export const exportScores = () => request.get('/scores/export', { responseType: 
 export const exportStudents = () => request.get('/students/export', { responseType: 'blob' })
 // 期末评价导出
 export const exportEvaluations = () => request.get('/evaluations/export', { responseType: 'blob' })
+
+// ================= AI 试卷批改 =================
+// 模型服务商预设与默认提示词
+export const getAiPresets = () => request.get('/ai-grading/presets')
+// 读取配置（总开关 + 供应商列表，apiKey 后端掩码）/ 保存总开关与当前激活供应商
+export const getAiConfig = () => request.get('/ai-grading/config')
+export const saveAiConfig = (data) => request.put('/ai-grading/config', data)
+export const testAiConnection = (data) => request.post('/ai-grading/test', data)
+// 多供应商管理：增 / 改 / 删 / 切换当前使用 / 测试已保存供应商
+export const addAiProvider = (data) => request.post('/ai-grading/providers', data)
+export const updateAiProvider = (id, data) => request.put(`/ai-grading/providers/${id}`, data)
+export const deleteAiProvider = (id) => request.delete(`/ai-grading/providers/${id}`)
+export const activateAiProvider = (id) => request.post(`/ai-grading/providers/${id}/activate`)
+export const testAiProvider = (id) => request.post(`/ai-grading/providers/${id}/test`)
+// 批改任务：列表 / 创建 / 详情 / 采纳 / 删除 / 导出文档
+export const getAiTasks = (params) => request.get('/ai-grading/tasks', { params })
+export const createAiTask = (formData) =>
+  request.post('/ai-grading/tasks', formData, { headers: { 'Content-Type': 'multipart/form-data' } })
+export const getAiTask = (id) => request.get(`/ai-grading/tasks/${id}`)
+export const adoptAiTask = (id, data) => request.post(`/ai-grading/tasks/${id}/adopt`, data)
+export const deleteAiTask = (id) => request.delete(`/ai-grading/tasks/${id}`)
+export const exportAiTask = (id) => request.get(`/ai-grading/tasks/${id}/export`, { responseType: 'blob' })

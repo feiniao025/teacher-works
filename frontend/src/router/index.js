@@ -33,6 +33,12 @@ const routes = [
         meta: { title: '试卷管理', icon: 'Document' }
       },
       {
+        path: 'teacher/ai-grading',
+        name: 'AiGrading',
+        component: () => import('../views/teacher/ai-grading.vue'),
+        meta: { title: 'AI 批改', icon: 'MagicStick' }
+      },
+      {
         path: 'teacher/recitations',
         name: 'Recitations',
         component: () => import('../views/teacher/recitations.vue'),

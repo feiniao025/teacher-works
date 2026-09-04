@@ -1,5 +1,6 @@
 node_modules/
 uploads/
 database.sqlite
+class-*.sqlite
 *.log
 .DS_Store
