@@ -36,14 +36,18 @@ mkdir -p "$RUN_DIR" "$LOG_DIR"
 set -m
 
 # Apple Silicon (M 系列芯片) 下, bash 执行的 node 可能走 Rosetta(x64) 兜底,
-# 导致 sqlite3/rollup 等原生绑定加载失败。这里统一强制使用原生 arm64 架构。
+# 导致 sqlite3/rollup 等原生绑定加载失败, 因此需强制以 arm64 运行。
+# 注意: 若 PATH 中的 node 是 x64-only(如 nvm 装的 x64 版), 直接 `arch -arm64 node`
+# 会报 "Bad CPU type in executable"。这里用 env(通用二进制)承载 arch -arm64, 并把
+# arm64 通用 node 所在目录提到 PATH 最前, 使 node/npm 子进程都解析到 arm64 工具链
+# (与 build.sh 的 run_native 保持一致)。
 run_native() {
   local is_apple_silicon=0
   if [ "$(uname -s)" = "Darwin" ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
     is_apple_silicon=1
   fi
   if [ "$is_apple_silicon" = "1" ]; then
-    arch -arm64 "$@"
+    arch -arm64 env PATH="/usr/local/bin:/opt/homebrew/bin:$PATH" "$@"
   else
     "$@"
   fi
