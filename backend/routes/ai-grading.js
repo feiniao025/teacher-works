@@ -89,7 +89,16 @@ function normalizeProvider(raw, apiKeyOverride) {
     model,
     multimodal: p.multimodal !== undefined ? !!p.multimodal : true,
     temperature: (p.temperature !== undefined && p.temperature !== null && p.temperature !== '') ? Number(p.temperature) : 0.1,
-    max_tokens: (p.max_tokens !== undefined && p.max_tokens !== null && p.max_tokens !== '') ? Number(p.max_tokens) : 3000,
+    // max_tokens<=0 表示「不限制输出长度」：不下发该字段，交由模型按自身上下文上限自由生成。
+    // 推理型模型的思考也占额度，限制过小会导致答案被截断，故默认不限制。
+    max_tokens: (p.max_tokens !== undefined && p.max_tokens !== null && p.max_tokens !== '' && Number(p.max_tokens) > 0) ? Number(p.max_tokens) : 0,
+    // 流式响应：默认开启（实时进度 + 空闲超时守护，慢速推理模型长卷也不会被误判超时）
+    stream: p.stream !== undefined ? !!p.stream : true,
+    // 思考模式：default=跟随模型（不干预）；suppress=抑制思考（best-effort 关闭 + 思考失控保护）。
+    // 缺省 default，保证既有供应商行为不变。
+    thinking_mode: (p.thinking_mode === 'suppress') ? 'suppress' : 'default',
+    // 思考上限（字符）：仅 suppress 模式生效——思考超过此字数仍未作答即中止，防止失控空转。
+    reasoning_limit: (p.reasoning_limit !== undefined && p.reasoning_limit !== null && p.reasoning_limit !== '' && Number(p.reasoning_limit) > 0) ? Number(p.reasoning_limit) : 15000,
     system_prompt: p.system_prompt !== undefined ? String(p.system_prompt) : ''
   };
 }
@@ -129,7 +138,12 @@ async function loadActiveConfig() {
       base_url: process.env.AI_BASE_URL || '',
       api_key: process.env.AI_API_KEY || '',
       model: process.env.AI_MODEL || '',
-      multimodal: true, temperature: 0.1, max_tokens: 3000, system_prompt: ''
+      multimodal: true, temperature: 0.1,
+      max_tokens: Number(process.env.AI_MAX_TOKENS) || 0, // 0=不限制输出长度
+      stream: process.env.AI_STREAM !== '0', // 默认开启流式
+      thinking_mode: process.env.AI_THINKING_MODE === 'suppress' ? 'suppress' : 'default',
+      reasoning_limit: Number(process.env.AI_REASONING_LIMIT) || 15000,
+      system_prompt: ''
     };
   }
   return { enabled, config: config || { base_url: '', model: '', api_key: '' } };
@@ -147,6 +161,9 @@ router.get('/ai-grading/config', async (req, res) => {
     const list = providers.map(p => ({
       id: p.id, name: p.name, provider: p.provider, base_url: p.base_url, model: p.model,
       multimodal: p.multimodal, temperature: p.temperature, max_tokens: p.max_tokens,
+      stream: p.stream !== false, // 缺省视为开启，与 normalizeProvider 默认一致
+      thinking_mode: p.thinking_mode === 'suppress' ? 'suppress' : 'default', // 缺省 default
+      reasoning_limit: (p.reasoning_limit !== undefined && p.reasoning_limit !== null && Number(p.reasoning_limit) > 0) ? Number(p.reasoning_limit) : 15000,
       system_prompt: p.system_prompt, api_key_set: !!p.api_key, api_key_masked: maskKey(p.api_key)
     }));
     const active = resolveActive(providers, activeId);
@@ -269,6 +286,11 @@ router.post('/ai-grading/test', async (req, res) => {
 
 // ============ AI 批改任务 ============
 
+// 批改实时进度（taskId -> {stage, text, chars, elapsed_seconds, updated_at}）：
+// 仅存内存、任务结束即清除。进度是瞬态信息无需落库；单进程部署下前端轮询 GET /tasks/:id
+// 与本 Map 在同一进程，可直接读取，从而展示「模型思考中…已生成 N 字」的流式进度。
+const taskProgress = new Map();
+
 // 后台异步执行批改：脱离请求上下文，用 runWithClass 透传班级库
 async function runGradingAsync(taskId, ctx, config, imageFiles, examContext) {
   if (!ctx) {
@@ -284,7 +306,9 @@ async function runGradingAsync(taskId, ctx, config, imageFiles, examContext) {
     });
 
     const absPaths = imageFiles.map(f => path.join(__dirname, '..', 'uploads', f));
-    const result = await gradePaper(config, absPaths, examContext);
+    // 流式进度回调：把「思考中/作答中，已生成 N 字」写入内存 Map，供前端轮询展示
+    const onProgress = (p) => { taskProgress.set(String(taskId), { ...p, updated_at: Date.now() }); };
+    const result = await gradePaper(config, absPaths, examContext, onProgress);
 
     await withClass(async () => {
       const db = await getDb();
@@ -307,6 +331,9 @@ async function runGradingAsync(taskId, ctx, config, imageFiles, examContext) {
         );
       });
     } catch (e) { /* 兜底写库失败，忽略 */ }
+  } finally {
+    // 无论成功/失败都清理进度，避免 Map 泄漏；任务状态已落库，前端据 status 切换展示
+    taskProgress.delete(String(taskId));
   }
 }
 
@@ -343,6 +370,10 @@ router.get('/ai-grading/tasks', async (req, res) => {
     if (student_id) { sql += ' AND t.student_id = ?'; params.push(student_id); }
     sql += ' ORDER BY t.created_at DESC';
     const rows = await db.all(sql, params);
+    // 为进行中的任务附带实时进度（内存态），供列表/详情展示
+    rows.forEach(r => {
+      if (r.status === 'pending' || r.status === 'processing') r.progress = taskProgress.get(String(r.id)) || null;
+    });
     sendResponse(res, rows);
   } catch (err) {
     sendResponse(res, null, err.message, 500);
@@ -413,6 +444,10 @@ router.get('/ai-grading/tasks/:id', async (req, res) => {
       try { detail = JSON.parse(row.detail); } catch (e) { detail = null; }
     }
     row.detail = detail;
+    // 进行中附带实时进度（内存态）：前端详情弹窗每 2.5s 轮询即可看到「已生成 N 字」
+    row.progress = (row.status === 'pending' || row.status === 'processing')
+      ? (taskProgress.get(String(row.id)) || null)
+      : null;
     sendResponse(res, row);
   } catch (err) {
     sendResponse(res, null, err.message, 500);

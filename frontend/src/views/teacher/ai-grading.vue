@@ -160,7 +160,9 @@
 
         <el-alert
           v-if="currentTask.status === 'processing' || currentTask.status === 'pending'"
-          type="info" :closable="false" show-icon title="AI 正在批改中，请稍候…" style="margin-bottom: 12px"
+          type="info" :closable="false" show-icon
+          :title="currentTask.progress && currentTask.progress.text ? currentTask.progress.text : 'AI 正在批改中，请稍候…'"
+          description="批改整卷可能需要数分钟，请勿关闭页面；完成后会自动展示结果" style="margin-bottom: 12px"
         />
         <el-alert
           v-else-if="currentTask.status === 'failed'"
@@ -313,7 +315,7 @@
         </el-form-item>
         <el-form-item label="服务地址">
           <el-input v-model="providerForm.base_url" placeholder="如 https://api.deepseek.com" />
-          <div class="form-tip">OpenAI 兼容 base_url，系统会自动拼接 /chat/completions</div>
+          <div class="form-tip">OpenAI 兼容 base_url，系统自动拼接 /chat/completions；本地服务（LM Studio / Ollama / vLLM）通常需以 /v1 结尾，遗漏时系统会自动兜底重试</div>
         </el-form-item>
         <el-form-item label="API Key">
           <el-input
@@ -334,8 +336,34 @@
           <el-input-number v-model="providerForm.temperature" :min="0" :max="2" :step="0.1" :precision="1" />
           <span class="form-tip" style="margin-left: 10px">越低越稳定，批改建议 0~0.3</span>
         </el-form-item>
-        <el-form-item label="最大 Tokens">
-          <el-input-number v-model="providerForm.max_tokens" :min="256" :max="16000" :step="256" />
+        <el-form-item label="流式响应">
+          <el-switch v-model="providerForm.stream" />
+          <span class="form-tip" style="margin-left: 10px">开启后批改中实时显示「思考中/作答中，已生成 N 字」，并以「空闲超时」守护——慢速推理模型批改长卷也不会被误判超时（推荐开启）</span>
+        </el-form-item>
+        <el-form-item label="限制 Tokens">
+          <el-switch v-model="providerForm.limit_tokens" />
+          <el-input-number
+            v-if="providerForm.limit_tokens"
+            v-model="providerForm.max_tokens" :min="256" :max="32000" :step="256" style="margin-left: 10px"
+          />
+          <div class="form-tip">
+            {{ providerForm.limit_tokens
+              ? '限制模型最多生成的 Tokens；推理型模型的思考过程也占用此额度，批改整卷建议 16000 以上'
+              : '不限制：不下发 max_tokens，由模型按自身上下文上限自由生成（推荐，尤其推理型模型——避免思考占满额度导致答案被截断）。云端按量计费时可开启限制以控制成本' }}
+          </div>
+        </el-form-item>
+        <el-form-item label="思考模式">
+          <el-switch v-model="providerForm.thinking_mode" active-value="suppress" inactive-value="default" />
+          <span class="form-tip" style="margin-left: 10px">{{ providerForm.thinking_mode === 'suppress' ? '抑制思考（推荐本地/推理型模型）' : '默认（跟随模型）' }}</span>
+          <div v-if="providerForm.thinking_mode === 'suppress'" style="margin-top: 6px">
+            <span class="form-tip">思考上限（字）：</span>
+            <el-input-number v-model="providerForm.reasoning_limit" :min="1000" :max="100000" :step="1000" size="small" />
+          </div>
+          <div class="form-tip">
+            {{ providerForm.thinking_mode === 'suppress'
+              ? '对支持的模型（云端 Qwen3 / DeepSeek 等）尽力关闭思考过程；对所有模型启用「思考失控保护」——思考超过上限字数仍未作答即中止，避免推理型模型长时间空转'
+              : '不干预模型的思考过程，仅保留极高的失控兜底。若模型思考冗长、或长时间不作答，建议开启「抑制思考」' }}
+          </div>
         </el-form-item>
         <el-form-item label="系统提示词">
           <el-input
@@ -625,7 +653,11 @@ const openAddProvider = () => {
     model: preset.model || '',
     multimodal: preset.multimodal !== false,
     temperature: 0.1,
-    max_tokens: 3000,
+    stream: true,          // 默认开启流式：实时进度 + 避免长等待超时
+    limit_tokens: false,   // 默认不限制输出长度（推理型模型不会被截断）
+    max_tokens: 8000,      // 仅在开启「限制 Tokens」时生效
+    thinking_mode: 'default',  // 默认跟随模型；本地/推理型模型可改「抑制思考」
+    reasoning_limit: 15000,    // 仅「抑制思考」生效：思考超此字数仍未作答即中止
     system_prompt: ''
   }
   providerVisible.value = true
@@ -644,7 +676,11 @@ const openEditProvider = (p) => {
     model: p.model || '',
     multimodal: p.multimodal !== false,
     temperature: p.temperature ?? 0.1,
-    max_tokens: p.max_tokens || 3000,
+    stream: p.stream !== false,               // 缺省视为开启
+    limit_tokens: (p.max_tokens || 0) > 0,    // 有限制值才算「限制」
+    max_tokens: (p.max_tokens || 0) > 0 ? p.max_tokens : 8000,
+    thinking_mode: p.thinking_mode === 'suppress' ? 'suppress' : 'default',
+    reasoning_limit: (p.reasoning_limit || 0) > 0 ? p.reasoning_limit : 15000,
     system_prompt: p.system_prompt || ''
   }
   providerVisible.value = true
@@ -662,6 +698,11 @@ const onProviderPresetChange = (key) => {
 const restoreDefaultPrompt = () => {
   providerForm.value.system_prompt = defaultPrompt.value
 }
+// 把 UI 专用的 limit_tokens 开关翻译成后端语义：关闭限制 => max_tokens=0（不下发，模型自由生成）
+const buildProviderPayload = () => {
+  const f = providerForm.value
+  return { ...f, max_tokens: f.limit_tokens ? (Number(f.max_tokens) || 0) : 0 }
+}
 // 保存供应商（新增 / 编辑）
 const saveProvider = async () => {
   if (!providerForm.value.base_url || !providerForm.value.model) {
@@ -669,11 +710,12 @@ const saveProvider = async () => {
   }
   providerSaving.value = true
   try {
+    const payload = buildProviderPayload()
     if (editingProviderId.value) {
-      await updateAiProvider(editingProviderId.value, providerForm.value)
+      await updateAiProvider(editingProviderId.value, payload)
       ElMessage.success('供应商已更新')
     } else {
-      await addAiProvider(providerForm.value)
+      await addAiProvider(payload)
       ElMessage.success('供应商已添加')
     }
     providerVisible.value = false
@@ -689,7 +731,7 @@ const testConn = async () => {
   }
   testing.value = true
   try {
-    const payload = { ...providerForm.value }
+    const payload = buildProviderPayload()
     if (editingProviderId.value) payload.provider_id = editingProviderId.value
     const r = await testAiConnection(payload)
     ElMessage.success('连接成功' + (r && r.reply ? `：${r.reply}` : ''))

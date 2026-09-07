@@ -2,11 +2,37 @@
 // AI 试卷批改 - 模型调用服务层
 // 统一走 OpenAI 兼容协议（Chat Completions），一套逻辑覆盖：
 //   官方 Qwen-VL / DeepSeek-Vision / 本地 Ollama / OpenAI 及任意兼容中转
-// 仅依赖 Node 18+ 内置 fetch，不引入新三方包，避免影响 Alpine 构建与 /deps 卷。
+// 仅依赖 Node 内置 http/https 核心模块（不用 fetch，以规避 undici 默认 300s headers/body 超时
+// 对慢速本地推理模型的误杀），不引入新三方包，避免影响 Alpine 构建与 /deps 卷。
 // ============================================================
 
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
+const https = require('https');
+
+// 批改调用超时上限：本地推理型模型批改整卷非常慢——实测一张小学数学卷仅「思考」就产出
+// 5000+ reasoning tokens、约 18 t/s，需 6~8 分钟才吐出答案 JSON。批改是异步任务
+// （前端每 2.5s 轮询、无次数上限），故给足超时避免慢模型被误判失败。
+// 注意：必须显著大于 300s，否则会与旧实现里 fetch(undici) 的默认 headers 超时混淆。
+// 可用环境变量 AI_GRADING_TIMEOUT_MS 覆盖。
+// 说明：这是「非流式」调用的总时长上限；开启流式(stream)后改由下面的空闲超时守护——
+// 只要模型持续吐字就不会误杀，长卷批改（十几分钟）也能正常完成。
+const GRADING_TIMEOUT_MS = Number(process.env.AI_GRADING_TIMEOUT_MS) || 900000;
+
+// 流式调用的「空闲超时」：相邻两个数据块之间的最大允许间隔，而非总时长。
+// 取值需覆盖「首字节延迟」——多图批改时模型要先做视觉编码才吐第一个字：实测 2 张图约 65s，
+// 6 张图可能达 ~200s。故默认 300s：既容得下大图批次的首字节等待，又能在真正卡死时 5 分钟内判定。
+// 首字节之后推理模型持续吐字（约每 50~100ms 一块），空闲计时会被不断重置，长卷批改不会误杀。
+// 可用环境变量 AI_STREAM_IDLE_TIMEOUT_MS 覆盖。
+const STREAM_IDLE_TIMEOUT_MS = Number(process.env.AI_STREAM_IDLE_TIMEOUT_MS) || 300000;
+
+// 「思考失控保护」兜底阈值（字符数）：流式返回时，若思考(reasoning)累计超过此字数、而答案正文(content)
+// 仍为空，判定模型陷入失控推理（实测某些本地推理模型在整卷上会思考数万字却始终不作答），提前中止以免长时间空转。
+// default 思考模式用此很高的兜底值（仅防真正无限空转，不误伤「长思考后正常作答」）；
+// suppress 思考模式改用供应商配置的 reasoning_limit（更紧，见 normalizeProvider 默认 15000）。
+// 可用环境变量 AI_REASONING_RUNAWAY_LIMIT 覆盖 default 模式兜底值。
+const REASONING_RUNAWAY_DEFAULT = Number(process.env.AI_REASONING_RUNAWAY_LIMIT) || 40000;
 
 // 模型服务商预设：前端选择后自动回填 base_url / model，用户仍可自由修改
 const PROVIDER_PRESETS = [
@@ -103,7 +129,7 @@ function normalizeResult(v) {
   return 'unknown';
 }
 
-// 归一化 base_url 为完整的 chat/completions 端点
+// 归一化 base_url 为完整的 chat/completions 端点（按用户填写原样补全）
 function normalizeBaseUrl(baseUrl) {
   if (!baseUrl || !String(baseUrl).trim()) {
     throw new Error('未配置模型服务地址（base_url）');
@@ -111,6 +137,19 @@ function normalizeBaseUrl(baseUrl) {
   let u = String(baseUrl).trim().replace(/\/+$/, '');
   if (/\/chat\/completions$/i.test(u)) return u;
   return u + '/chat/completions';
+}
+
+// 生成候选端点（按顺序尝试）：兼容用户只填服务根地址、漏掉 /v1 的常见情况。
+// 多数 OpenAI 兼容服务（LM Studio / Ollama / vLLM）实际端点在 /v1 下，而 DeepSeek
+// 官方等无需 /v1。故首个候选按填写原样；若 base 不含 /vN 版本段，再补一个 /v1 兜底。
+function buildEndpointCandidates(baseUrl) {
+  const primary = normalizeBaseUrl(baseUrl); // base_url 为空时在此抛错
+  const candidates = [primary];
+  const base = String(baseUrl).trim().replace(/\/+$/, '');
+  if (!/\/chat\/completions$/i.test(base) && !/\/v\d+(\/|$)/i.test(base)) {
+    candidates.push(`${base}/v1/chat/completions`);
+  }
+  return candidates;
 }
 
 function mimeOf(filePath) {
@@ -152,7 +191,13 @@ function buildUserText(examContext = {}) {
 
 function buildGradingMessages(config, imageDataUrls, examContext) {
   const system = (config.system_prompt && String(config.system_prompt).trim()) || DEFAULT_SYSTEM_PROMPT;
-  const content = [{ type: 'text', text: buildUserText(examContext) }];
+  let userText = buildUserText(examContext);
+  // 「抑制思考」：追加 Qwen3 系软开关 /no_think 与简洁作答提示。对支持的模型（云端 Qwen3 等）可直接关闭思考；
+  // 对忽略该开关的本地模型无害——真正的兜底是 postChatStream 里的「思考失控保护」。
+  if (config.thinking_mode === 'suppress') {
+    userText += '\n请简洁思考、尽快直接输出最终 JSON 答案，不要展开冗长推理。 /no_think';
+  }
+  const content = [{ type: 'text', text: userText }];
   for (const url of imageDataUrls) {
     content.push({ type: 'image_url', image_url: { url } });
   }
@@ -190,17 +235,76 @@ function normalizeQuestion(q, i) {
   };
 }
 
-function parseGradingResult(text) {
-  if (!text || !str(text).trim()) {
-    throw new Error('模型未返回任何内容');
+// 尝试修复 LLM 常见的 JSON 小错误（不改语义、只做安全修补）：
+//   ① 去掉对象/数组结尾的多余逗号：,} -> }  ,] -> ]
+//   ② 补上相邻对象间缺失的逗号：}{ -> },{（合法 JSON 中 } 后紧跟 { 必然是漏了逗号）
+function repairJsonText(s) {
+  let out = str(s);
+  out = out.replace(/,(\s*[}\]])/g, '$1');
+  out = out.replace(/}\s*{/g, '},{');
+  return out;
+}
+
+// 从损坏/残缺的文本中尽力「打捞」可用批改结果：即使整段 JSON 无法解析，也逐个抓取其中完整的
+// question 对象与顶层 full_score/total_score/overall_comment，尽量给出部分结果（优于整单失败）。
+function salvageGradingResult(text) {
+  const s = str(text);
+  if (!s) return null;
+  const pickNum = (key) => {
+    const m = s.match(new RegExp('"' + key + '"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)'));
+    return m ? parseFloat(m[1]) : null;
+  };
+  const pickStr = (key) => {
+    const m = s.match(new RegExp('"' + key + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"'));
+    return m ? m[1] : null;
+  };
+  // 从 questions 数组起点开始，用括号配对逐个截取完整的 {...} 对象并单独解析（容忍尾部残缺）
+  const questions = [];
+  const qKey = s.indexOf('"questions"');
+  const arrStart = qKey >= 0 ? s.indexOf('[', qKey) : s.indexOf('[');
+  if (arrStart >= 0) {
+    let depth = 0, objStart = -1, inStr = false, esc = false;
+    for (let i = arrStart; i < s.length; i++) {
+      const ch = s[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') { inStr = true; continue; }
+      if (ch === '{') { if (depth === 0) objStart = i; depth++; }
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0 && objStart >= 0) {
+          const chunk = s.slice(objStart, i + 1);
+          let o = null;
+          try { o = JSON.parse(chunk); } catch (e) { try { o = JSON.parse(repairJsonText(chunk)); } catch (e2) { o = null; } }
+          const q = o ? normalizeQuestion(o, questions.length) : null;
+          if (q) questions.push(q);
+          objStart = -1;
+        }
+      } else if (ch === ']' && depth === 0) break; // questions 数组正常结束
+    }
   }
-  const jsonStr = extractJsonText(text);
-  let obj;
-  try {
-    obj = JSON.parse(jsonStr);
-  } catch (e) {
-    throw new Error(`模型返回内容无法解析为 JSON（${e.message}）。原始返回片段：${str(text).slice(0, 400)}`);
-  }
+  const full = pickNum('full_score');
+  const total = pickNum('total_score');
+  const comment = pickStr('overall_comment');
+  if (!questions.length && full === null && total === null) return null;
+  const sumFull = questions.reduce((a, q) => a + q.full_score, 0);
+  const sumScore = questions.reduce((a, q) => a + q.score, 0);
+  const note = `【系统提示】模型返回的 JSON 存在损坏或不完整，已启用容错恢复 ${questions.length} 道题；结果可能不完整，请人工核对后再采用。`;
+  return {
+    full_score: full !== null ? full : sumFull,
+    total_score: total !== null ? total : sumScore,
+    overall_comment: (comment ? comment + '\n\n' : '') + note,
+    questions,
+    _salvaged: true
+  };
+}
+
+// 由已解析对象构建标准批改结果
+function buildResultFromObject(obj) {
   const questions = Array.isArray(obj.questions)
     ? obj.questions.map(normalizeQuestion).filter(Boolean)
     : [];
@@ -214,75 +318,333 @@ function parseGradingResult(text) {
   };
 }
 
-// ---------- 核心调用 ----------
-async function callChatCompletion(config, messages, { timeoutMs = 180000 } = {}) {
-  if (typeof fetch !== 'function') {
-    throw new Error('当前 Node 版本过低，缺少内置 fetch，请升级到 Node 18+');
+function parseGradingResult(text) {
+  if (!text || !str(text).trim()) {
+    throw new Error('模型未返回任何内容');
   }
-  const url = normalizeBaseUrl(config.base_url);
-  const headers = { 'Content-Type': 'application/json' };
-  if (config.api_key) headers['Authorization'] = `Bearer ${config.api_key}`;
+  const jsonStr = extractJsonText(text);
+  // ① 直接解析
+  try {
+    return buildResultFromObject(JSON.parse(jsonStr));
+  } catch (e1) {
+    // ② 修复常见小错误（缺逗号/尾逗号）后再解析
+    try {
+      const repaired = repairJsonText(jsonStr);
+      if (repaired !== jsonStr) return buildResultFromObject(JSON.parse(repaired));
+    } catch (e2) { /* 落到打捞 */ }
+    // ③ 容错打捞：从损坏/残缺文本中尽量恢复可用的题目与总分（优于整单失败）
+    const salvaged = salvageGradingResult(jsonStr) || salvageGradingResult(str(text));
+    if (salvaged) {
+      console.warn(`[aiModel] JSON 解析失败，已启用容错打捞：恢复 ${salvaged.questions.length} 道题（原始错误：${e1.message}）`);
+      return salvaged;
+    }
+    // ④ 彻底无法恢复：给出可操作提示（不再一律归因于「截断」）
+    throw new Error(`模型返回的 JSON 格式有误、无法解析（${e1.message}）。常见原因：模型输出的 JSON 结构损坏（如漏逗号）、或被「限制 Tokens」截断。建议：关闭「限制 Tokens」、将「思考模式」设为「抑制思考」以精简输出，或重试/更换模型。原始返回片段：${str(text).slice(0, 800)}`);
+  }
+}
 
+// ---------- 核心调用 ----------
+
+// 单次 POST：网络层/超时以异常抛出，HTTP 响应统一以 {status, ok, text} 返回，
+// 由 interpretChatResponse 决定成败与是否换端点重试，便于对多个候选复用同一套判定。
+// 用 Node 核心 http/https 发起 POST，而非 fetch：
+// fetch(undici) 有默认 300s 的 headersTimeout/bodyTimeout，非流式调用时服务端要等整段生成
+// 完才发响应头，慢速本地推理模型（>5min）会在 300s 被 undici 提前中断（表现为 "fetch failed"，
+// 服务端日志 "Client disconnected"）。http.request 客户端侧无默认超时，完全由我们的 timeoutMs 掌控。
+function postChatOnce(url, headers, bodyStr, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try {
+      u = new URL(url);
+    } catch (e) {
+      reject(new Error(`无效的模型服务地址：${url}`));
+      return;
+    }
+    const lib = u.protocol === 'https:' ? https : http;
+    const buf = Buffer.from(bodyStr, 'utf8');
+    let timer = null;
+    let settled = false;
+    const settle = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      fn(arg);
+    };
+    const req = lib.request(
+      u,
+      { method: 'POST', headers: { ...headers, 'Content-Length': Buffer.byteLength(buf) } },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const status = res.statusCode || 0;
+          settle(resolve, { status, ok: status >= 200 && status < 300, text: Buffer.concat(chunks).toString('utf8') });
+        });
+        res.on('error', (e) => settle(reject, e));
+      }
+    );
+    req.on('error', (e) => settle(reject, e));
+    // 只由这个总超时控制：到点主动 destroy，触发 req 'error'（name=AbortError）
+    timer = setTimeout(() => {
+      const err = new Error(`调用超时（>${Math.round(timeoutMs / 1000)}s）`);
+      err.name = 'AbortError';
+      req.destroy(err);
+    }, timeoutMs);
+    req.end(buf);
+  });
+}
+
+// 流式 POST（SSE）：请求体 stream:true，服务端边生成边以 `data: {json}` 逐块下发。
+// 价值：① 响应头几乎立即返回，彻底规避「等整段生成完才发头」导致的 headers 超时；
+//       ② 用「空闲超时」(两块之间的最大间隔) 取代「总时长超时」——只要模型持续吐字（哪怕整卷
+//          要十几分钟）就不会被误杀，只有真正卡住(长时间无任何输出)才判超时；
+//       ③ 实时回调 onProgress，让前端显示「思考中/作答中，已生成 N 字」。
+// 兼容降级：若服务端并非 SSE（返回普通 JSON——不支持 stream、或漏填 /v1 被兜底成错误），
+//          以 {kind:'buffered', status, ok, text} 返回，交由 interpretChatResponse 统一判定/换端点。
+function postChatStream(url, headers, bodyStr, { idleTimeoutMs = 180000, onProgress = null, reasoningLimit = 0 } = {}) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try {
+      u = new URL(url);
+    } catch (e) {
+      reject(new Error(`无效的模型服务地址：${url}`));
+      return;
+    }
+    const lib = u.protocol === 'https:' ? https : http;
+    const buf = Buffer.from(bodyStr, 'utf8');
+    const startedAt = Date.now();
+    let timer = null;
+    let settled = false;
+    const settle = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      fn(arg);
+    };
+    // 空闲计时：每收到一块数据就重置；到点仍无数据则判定服务卡死并 destroy
+    const resetIdle = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        const err = new Error(`模型已 ${Math.round(idleTimeoutMs / 1000)}s 无任何输出`);
+        err.name = 'AbortError';
+        req.destroy(err);
+      }, idleTimeoutMs);
+    };
+
+    let content = '';
+    let reasoning = '';
+    let finishReason = '';
+    let lineBuf = '';
+    let lastEmit = 0;
+    const rawChunks = []; // 非 SSE 时缓存完整响应体
+
+    const emitProgress = (force) => {
+      if (!onProgress) return;
+      const now = Date.now();
+      if (!force && now - lastEmit < 400) return; // 轻量节流，避免高频回调
+      lastEmit = now;
+      const rChars = reasoning.length;
+      const cChars = content.length;
+      const elapsed = Math.round((now - startedAt) / 1000);
+      const stage = cChars > 0 ? 'answering' : (rChars > 0 ? 'thinking' : 'connecting');
+      const text = stage === 'answering'
+        ? `模型正在作答…已生成 ${cChars} 字（用时 ${elapsed}s）`
+        : stage === 'thinking'
+          ? `模型正在思考…已生成 ${rChars} 字（用时 ${elapsed}s）`
+          : `已连接模型，等待输出…（用时 ${elapsed}s）`;
+      try {
+        onProgress({ stage, reasoning_chars: rChars, content_chars: cChars, chars: rChars + cChars, elapsed_seconds: elapsed, text });
+      } catch (e) { /* 进度回调异常不得影响主流程 */ }
+    };
+
+    const req = lib.request(
+      u,
+      { method: 'POST', headers: { ...headers, 'Content-Length': Buffer.byteLength(buf), 'Accept': 'text/event-stream' } },
+      (res) => {
+        const status = res.statusCode || 0;
+        const ctype = String(res.headers['content-type'] || '');
+        const ok = status >= 200 && status < 300;
+        // 非 2xx 或非 SSE：缓存整段响应体，按普通响应交上层判定（含 /v1 兜底换端点）
+        if (!ok || !/text\/event-stream/i.test(ctype)) {
+          res.on('data', (c) => { resetIdle(); rawChunks.push(c); });
+          res.on('end', () => settle(resolve, { kind: 'buffered', status, ok, text: Buffer.concat(rawChunks).toString('utf8') }));
+          res.on('error', (e) => settle(reject, e));
+          return;
+        }
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => {
+          resetIdle();
+          lineBuf += chunk;
+          let idx;
+          // SSE 以换行分隔；跨 TCP 分片的半行留在 lineBuf 里等下一块补齐
+          while ((idx = lineBuf.indexOf('\n')) >= 0) {
+            const line = lineBuf.slice(0, idx).replace(/\r$/, '').trim();
+            lineBuf = lineBuf.slice(idx + 1);
+            if (!line || !line.startsWith('data:')) continue;
+            const payload = line.slice(5).trim();
+            if (!payload || payload === '[DONE]') continue;
+            let j;
+            try { j = JSON.parse(payload); } catch (e) { continue; }
+            const choice = (j.choices && j.choices[0]) || {};
+            const delta = choice.delta || {};
+            if (typeof delta.content === 'string') content += delta.content;
+            // 推理型模型的思考流：不同服务字段名可能是 reasoning_content 或 reasoning
+            const rc = delta.reasoning_content !== undefined ? delta.reasoning_content : delta.reasoning;
+            if (typeof rc === 'string') reasoning += rc;
+            if (choice.finish_reason) finishReason = choice.finish_reason;
+            emitProgress(false);
+            // 思考失控保护：思考(reasoning)已超上限、而答案正文(content)仍为空 => 判定失控，提前中止。
+            // 仅在「有思考、无答案」时触发；一旦开始产出正文即不再干预，故正常的长思考后作答不会被误杀。
+            if (reasoningLimit > 0 && content.length === 0 && reasoning.length >= reasoningLimit) {
+              const err = new Error(`模型思考已超过 ${reasoningLimit} 字仍未开始作答`);
+              err.name = 'ReasoningRunaway';
+              emitProgress(true);
+              settle(reject, err); // 先确定性地以该错误 reject，避免被随后的 socket 错误覆盖
+              req.destroy();       // 再销毁底层请求，停止接收
+              return;
+            }
+          }
+        });
+        res.on('end', () => {
+          emitProgress(true);
+          settle(resolve, { kind: 'streamed', content, reasoning, finish_reason: finishReason });
+        });
+        res.on('error', (e) => settle(reject, e));
+      }
+    );
+    req.on('error', (e) => settle(reject, e));
+    resetIdle(); // 启动首个空闲计时，覆盖「连接 + 首字节」等待
+    req.end(buf);
+  });
+}
+
+// 组装请求体：max_tokens 是「要求模型最多生成多少」的上限，并非本服务作为接收端的限制。
+// 推理型模型的思考(reasoning)也计入该额度，设太小会导致思考占满额度、答案(content)为空而被截断。
+// 因此当 max_tokens<=0（用户在配置里选择「不限制」）时，直接不下发该字段，交由模型按自身上下文上限自由生成。
+function buildRequestBody(config, messages, stream) {
   const body = {
     model: config.model,
     messages,
     temperature: typeof config.temperature === 'number' ? config.temperature : 0.1,
-    max_tokens: num(config.max_tokens, 3000),
-    stream: false
+    stream: !!stream
   };
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: controller.signal
-    });
-    // await resp.text() 必须仍在超时保护内：Node fetch 在响应头到达即 resolve，
-    // 若提前 clearTimeout，上游“发头不发体”的半开连接会让 text() 永久挂起、任务卡在 processing。
-    const text = await resp.text();
-    if (!resp.ok) {
-      let detail = text.slice(0, 400);
-      try {
-        const errObj = JSON.parse(text);
-        detail = errObj?.error?.message || errObj?.message || detail;
-      } catch (e) { /* 保留原始文本 */ }
-      throw new Error(`模型接口返回 ${resp.status}：${detail}`);
-    }
-
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch (e) {
-      throw new Error(`模型返回非 JSON 内容：${text.slice(0, 300)}`);
-    }
-    const choice = data?.choices?.[0];
-    // 输出被 max_tokens 截断时 JSON 往往不完整，给出可操作提示而非笼统的“无法解析”
-    if (choice?.finish_reason === 'length') {
-      throw new Error('模型输出被截断（达到最大 Tokens 上限），请在配置中调大「最大 Tokens」或减少单次上传的图片数量');
-    }
-    const content = choice?.message?.content;
-    if (typeof content === 'string') return content;
-    if (Array.isArray(content)) return content.map((c) => c?.text || '').join('');
-    throw new Error('模型返回内容为空或结构异常（未找到 choices[0].message.content）');
-  } catch (e) {
-    if (e.name === 'AbortError') {
-      throw new Error(`调用模型超时（>${Math.round(timeoutMs / 1000)}s），请检查网络或改用更快的模型`);
-    }
-    // fetch 网络层错误（DNS/连接失败等）为 TypeError，转成更友好的提示；业务/解析错误原样抛出
-    if (e instanceof TypeError) {
-      throw new Error(`无法连接模型服务：${e.message}`);
-    }
-    throw e;
-  } finally {
-    clearTimeout(timer);
+  const mt = num(config.max_tokens, 0);
+  if (mt > 0) body.max_tokens = mt;
+  // 「抑制思考」的 best-effort 硬开关：HF 模板系服务端（vLLM / SGLang / 较新 llama.cpp）据此关闭思考。
+  // 实测本机 LM Studio 会忽略该字段（无害），此时改由「思考失控保护」兜底；云端 Qwen3 等则可真正生效。
+  if (config.thinking_mode === 'suppress') {
+    body.chat_template_kwargs = { enable_thinking: false };
   }
+  return JSON.stringify(body);
+}
+
+// 依据「正文 + finish_reason」判定结果，非流式与流式两条路径共用同一套判定：
+// 只要有非空正文就采用；正文为空且 finish_reason=length 判为截断；否则为无效正文。
+const MSG_TRUNCATED = '模型输出被截断：思考过程(reasoning)占满了「最大 Tokens」额度，未来得及输出答案正文。请在供应商配置中关闭「限制 Tokens」（即不限制输出长度），或将其调大后重试';
+const MSG_EMPTY = '模型未返回有效正文（content 为空）。可能触发了内容过滤、图片无法识别或输出被截断，请重试、更换模型，或关闭「限制 Tokens」';
+function decideFromContentAndReason(contentText, finishReason) {
+  if (contentText && contentText.trim()) return { kind: 'content', value: contentText };
+  if (finishReason === 'length') return { kind: 'fatal', error: new Error(MSG_TRUNCATED) };
+  return { kind: 'fatal', error: new Error(MSG_EMPTY) };
+}
+
+// 判定一次响应的结果：
+//   content -> 命中有效正文；miss -> 端点/路由未命中（可换下一候选，如补 /v1）；
+//   fatal   -> 明确失败（鉴权/截断/结构异常等），不应再换端点重试。
+function interpretChatResponse({ status, ok, text }) {
+  if (!ok) {
+    let detail = str(text).slice(0, 400);
+    try {
+      const o = JSON.parse(text);
+      detail = o?.error?.message || o?.error || o?.message || detail;
+    } catch (e) { /* 保留原始文本 */ }
+    // 404/405 多为路径不对（例如漏了 /v1），交给候选端点重试
+    if (status === 404 || status === 405) return { kind: 'miss', hint: detail };
+    return { kind: 'fatal', error: new Error(`模型接口返回 ${status}：${detail}`) };
+  }
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    // 200 却返回非 JSON（未知路径被兜底成 HTML/纯文本）——按端点未命中处理
+    return { kind: 'miss', hint: `模型返回非 JSON 内容：${str(text).slice(0, 200)}` };
+  }
+  if (!data || !Array.isArray(data.choices)) {
+    // 200 + JSON 但无 choices（如 LM Studio 对未知端点返回 {"error":"Unexpected endpoint..."}）
+    const emsg = data?.error?.message || data?.error || data?.message;
+    return { kind: 'miss', hint: emsg ? str(emsg).slice(0, 300) : '响应中缺少 choices 字段' };
+  }
+  const choice = data.choices[0];
+  const content = choice?.message?.content;
+  // 先取正文、再判截断：推理型模型的思考过程(reasoning_content)也占用 max_tokens 额度，
+  // 常令 finish_reason=length，但答案正文(content)其实已完整产出。故优先采用非空正文，
+  // 仅在正文确实为空时才按截断/异常处理（判定逻辑与流式路径共用 decideFromContentAndReason）。
+  let bodyText = '';
+  if (typeof content === 'string') bodyText = content;
+  else if (Array.isArray(content)) bodyText = content.map((c) => c?.text || '').join('');
+  return decideFromContentAndReason(bodyText, choice?.finish_reason);
+}
+
+// 调用 Chat Completions：按 buildEndpointCandidates 依次尝试候选端点，命中“端点未识别”
+// 时自动换下一个（例如用户漏填 /v1）；其余错误（超时/网络/鉴权/截断）如实抛出。
+async function callChatCompletion(config, messages, { timeoutMs = 180000, idleTimeoutMs = STREAM_IDLE_TIMEOUT_MS, onProgress = null, stream, reasoningLimit } = {}) {
+  const candidates = buildEndpointCandidates(config.base_url);
+  const headers = { 'Content-Type': 'application/json' };
+  if (config.api_key) headers['Authorization'] = `Bearer ${config.api_key}`;
+  // 默认启用流式（config.stream !== false）：实时进度 + 空闲超时守护，避免慢速推理模型长等待被误杀
+  const useStream = stream !== undefined ? !!stream : (config.stream !== false);
+  // 思考失控保护阈值：显式传入优先；否则 suppress 模式用供应商 reasoning_limit（默认 15000，0=关闭），
+  // default 模式用很高的兜底值（仅防真正无限空转）。仅对流式生效（非流式由总时长超时兜底）。
+  const rLimit = reasoningLimit !== undefined
+    ? reasoningLimit
+    : (config.thinking_mode === 'suppress' ? num(config.reasoning_limit, 15000) : REASONING_RUNAWAY_DEFAULT);
+  const bodyStr = buildRequestBody(config, messages, useStream);
+
+  const deadline = Date.now() + timeoutMs; // 多候选共享一个总超时（主要用于非流式与换端点重试）
+  let lastHint = '';
+  for (let i = 0; i < candidates.length; i++) {
+    const isLast = i === candidates.length - 1;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error(`批改超时：模型在 ${Math.round(timeoutMs / 60000)} 分钟内未返回完整结果，请重试或改用更快的模型`);
+    }
+    let outcome;
+    try {
+      if (useStream) {
+        const r = await postChatStream(candidates[i], headers, bodyStr, { idleTimeoutMs, onProgress, reasoningLimit: rLimit });
+        // 正常 SSE：用累积的正文 + finish_reason 判定；服务端未按 SSE 返回（不支持 stream /
+        // 漏填 /v1 被兜底成错误 JSON）则以 buffered 交 interpret 统一处理，仍能走 /v1 换端点重试
+        outcome = r.kind === 'streamed'
+          ? decideFromContentAndReason(r.content, r.finish_reason)
+          : interpretChatResponse(r);
+      } else {
+        const r = await postChatOnce(candidates[i], headers, bodyStr, remaining);
+        outcome = interpretChatResponse(r);
+      }
+    } catch (e) {
+      if (e && e.name === 'ReasoningRunaway') {
+        throw new Error(`模型思考失控：已生成超过 ${rLimit} 字的思考仍未开始作答，已提前中止以避免长时间空转。建议：减少单次上传的图片数量、将「思考模式」设为「抑制思考」并调低「思考上限」、或更换更快/非推理型模型`);
+      }
+      if (e && e.name === 'AbortError') {
+        throw new Error(useStream
+          ? `批改超时：模型已 ${Math.round(idleTimeoutMs / 1000)}s 无任何输出，可能已停止响应或网络中断。请重试；若持续如此，可减少单次上传的图片数量或改用更快的模型`
+          : `批改超时：模型在 ${Math.round(timeoutMs / 60000)} 分钟内未返回完整结果。建议开启「流式响应」以获取实时进度并避免长等待超时、减少单次上传的图片数量，或改用更快的模型`);
+      }
+      // 连接层错误（ECONNREFUSED / ENOTFOUND / ECONNRESET 等）统一成友好提示
+      throw new Error(`无法连接模型服务：${e && e.message ? e.message : String(e)}`);
+    }
+    if (outcome.kind === 'content') return outcome.value;
+    if (outcome.kind === 'fatal') throw outcome.error;
+    // miss：还有候选就换下一个端点重试，否则给出可操作的地址提示
+    lastHint = outcome.hint || lastHint;
+    if (!isLast) continue;
+    throw new Error(`模型服务未识别接口地址（${lastHint}）。请检查 base_url 是否需以 /v1 结尾，例如 http://<主机>:<端口>/v1`);
+  }
+  throw new Error('调用模型失败');
 }
 
 // 批改主入口：config + 图片绝对路径数组 + 试卷上下文 -> 结构化批改结果
-async function gradePaper(config, imageAbsPaths, examContext = {}) {
+async function gradePaper(config, imageAbsPaths, examContext = {}, onProgress = null) {
   if (!Array.isArray(imageAbsPaths) || imageAbsPaths.length === 0) {
     throw new Error('没有可批改的试卷图片');
   }
@@ -291,7 +653,11 @@ async function gradePaper(config, imageAbsPaths, examContext = {}) {
   }
   const dataUrls = await Promise.all(imageAbsPaths.map(imageToDataUrl));
   const messages = buildGradingMessages(config, dataUrls, examContext);
-  const raw = await callChatCompletion(config, messages);
+  const raw = await callChatCompletion(config, messages, {
+    timeoutMs: GRADING_TIMEOUT_MS,
+    idleTimeoutMs: STREAM_IDLE_TIMEOUT_MS,
+    onProgress
+  });
   const result = parseGradingResult(raw);
   result.raw = raw; // 保留原始返回，便于排查与二期复用
   return result;
@@ -301,7 +667,8 @@ async function gradePaper(config, imageAbsPaths, examContext = {}) {
 // 超时 20s（低于前端 axios 的 30s），保证上游慢时前端能收到后端的友好错误而非 axios 超时
 async function testConnection(config) {
   const messages = [{ role: 'user', content: '连接测试，请只回复两个字：正常' }];
-  const raw = await callChatCompletion(config, messages, { timeoutMs: 20000 });
+  // 测试用非流式：请求极小、要快速拿到完整回复，且连通性与是否流式无关
+  const raw = await callChatCompletion(config, messages, { timeoutMs: 20000, stream: false });
   return { ok: true, reply: str(raw).slice(0, 100) };
 }
 
@@ -309,6 +676,16 @@ module.exports = {
   PROVIDER_PRESETS,
   DEFAULT_SYSTEM_PROMPT,
   normalizeBaseUrl,
+  buildEndpointCandidates,
+  buildRequestBody,
+  buildGradingMessages,
+  decideFromContentAndReason,
+  interpretChatResponse,
+  postChatOnce,
+  postChatStream,
+  repairJsonText,
+  salvageGradingResult,
+  buildResultFromObject,
   parseGradingResult,
   gradePaper,
   testConnection
