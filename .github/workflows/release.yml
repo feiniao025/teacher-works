@@ -1,0 +1,87 @@
+# 发布自动化 CI：推送 v* tag 时，自动构建便携发布包(tar.gz/zip/sha256)并创建 GitHub Release 页面。
+#
+# 与 docker-publish.yml 的分工：
+#   - docker-publish.yml：构建「运行环境镜像」推送到 GHCR（供 Docker 部署，push master 或 v* tag 触发）
+#   - release.yml（本文件）：产出可下载的便携发布包并挂到 GitHub Release（供 Windows / 源码 / Docker 部署）
+# 推送一个 v* tag 会同时触发两者：一次发版即得到「GHCR 镜像 + 下载包 + Release 页面」。
+#
+# 版本号单一来源：backend/package.json（build.sh 从这里读取，发布包按此版本命名）。
+# Release 说明：仓库若存在 changelog/<tag>.md 则用它作正文（便于人工精修，如本版 v1.1.0）；
+#              否则由 GitHub 依据相邻 tag 间的提交自动生成（零维护，适合日常发版）。
+name: 发布 Release
+
+on:
+  push:
+    tags: ['v*']
+
+# 创建 Release / 上传附件需要写权限（GITHUB_TOKEN 由 GitHub 自动注入）
+permissions:
+  contents: write
+
+# 同一 tag 仅发布一次，避免重复触发互相覆盖
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 确保 zip 工具可用（Windows 发布包需要）
+        run: |
+          if ! command -v zip >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y zip
+          fi
+
+      # 便携发布包不含 backend/node_modules（build.sh 组装时会剔除），且 sqlite3 原生模块在 CI 上
+      # 编译既无必要又有失败风险。预建空目录让 build.sh 跳过「安装后端依赖」，对最终产物无任何影响。
+      - name: 跳过 CI 中无用的后端依赖安装
+        run: mkdir -p backend/node_modules
+
+      - name: 构建便携发布包
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: 校验产物已生成
+        run: |
+          echo "=== release/ 内容 ==="
+          ls -lh release/
+          if [ -z "$(ls -A release/ 2>/dev/null)" ]; then
+            echo "::error::release/ 为空，构建失败"; exit 1
+          fi
+
+      - name: 判定 Release 说明来源
+        id: notes
+        run: |
+          if [ -f "changelog/${GITHUB_REF_NAME}.md" ]; then
+            echo "mode=file" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=auto" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 创建 Release（使用 changelog 精修说明）
+        if: steps.notes.outputs.mode == 'file'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: changelog/${{ github.ref_name }}.md
+          files: release/*
+          fail_on_unmatched_files: true
+
+      - name: 创建 Release（自动生成说明）
+        if: steps.notes.outputs.mode == 'auto'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: release/*
+          fail_on_unmatched_files: true
