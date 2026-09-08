@@ -30,10 +30,10 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 设置 Node 20
+      - name: 设置 Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: 确保 zip 工具可用（Windows 发布包需要）
         run: |
@@ -45,6 +45,20 @@ jobs:
       # 编译既无必要又有失败风险。预建空目录让 build.sh 跳过「安装后端依赖」，对最终产物无任何影响。
       - name: 跳过 CI 中无用的后端依赖安装
         run: mkdir -p backend/node_modules
+
+      # 关键：package-lock.json 在 macOS(arm64) 生成，直接 npm install 到 linux(x64) 有时会漏装
+      # rollup/esbuild 的平台原生可选依赖，导致 vite build 崩溃（本次 exit 16 的最可能原因）。改用
+      # npm ci 严格按 lock 安装、正确选择当前平台的可选依赖；万一仍失败则删 lock 重新解析兜底
+      # （CI 工作区是临时的，不影响仓库）。装好后 build.sh 检测到 node_modules 已存在即跳过其
+      # 内置的 npm install，只执行构建，从而绕开这个跨平台坑。
+      - name: 安装前端依赖（npm ci，规避跨平台可选依赖缺失）
+        run: |
+          cd frontend
+          npm ci --no-audit --no-fund || {
+            echo "::warning::npm ci 失败，回退为删除 lock 后重新安装"
+            rm -f package-lock.json
+            npm install --no-audit --no-fund
+          }
 
       - name: 构建便携发布包
         run: |
