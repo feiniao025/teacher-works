@@ -157,7 +157,11 @@ cd "$STAGE_DIR"
 if command -v ditto &> /dev/null; then
   ditto -c -k --sequesterRsrc --keepParent teacher-ops "$RELEASE_DIR/$ARCHIVE.zip"
 elif command -v zip &> /dev/null; then
-  zip -r -q -x '._*' "$RELEASE_DIR/$ARCHIVE.zip" teacher-ops
+  # 注意: Info-ZIP 的 -x 排除模式必须放在「归档名 + 输入目录」之后, 它会把其后所有参数
+  # 都当作排除模式。若写成 `zip -r -q -x '._*' 归档名 目录`, 归档名与目录都会被当成排除项,
+  # 导致 "nothing to select from" 报错并以退出码 16 失败(macOS 走上面的 ditto 分支不受影响,
+  # 故此坑只在 Linux/CI 打包时暴露)。
+  zip -r -q "$RELEASE_DIR/$ARCHIVE.zip" teacher-ops -x '._*'
 else
   echo "      [警告] 未找到 zip 工具, 跳过 Windows zip 包(可用: brew install zip)"
 fi

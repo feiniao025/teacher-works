@@ -46,12 +46,11 @@ jobs:
       - name: 跳过 CI 中无用的后端依赖安装
         run: mkdir -p backend/node_modules
 
-      # 关键：package-lock.json 在 macOS(arm64) 生成，直接 npm install 到 linux(x64) 有时会漏装
-      # rollup/esbuild 的平台原生可选依赖，导致 vite build 崩溃（本次 exit 16 的最可能原因）。改用
-      # npm ci 严格按 lock 安装、正确选择当前平台的可选依赖；万一仍失败则删 lock 重新解析兜底
-      # （CI 工作区是临时的，不影响仓库）。装好后 build.sh 检测到 node_modules 已存在即跳过其
-      # 内置的 npm install，只执行构建，从而绕开这个跨平台坑。
-      - name: 安装前端依赖（npm ci，规避跨平台可选依赖缺失）
+      # 前端依赖用 npm ci 严格按 lock 安装（确定、可复现，是 CI 推荐做法）；装好后 build.sh 检测到
+      # node_modules 已存在即跳过其内置的 npm install，只执行 vite 构建。万一 ci 因 lock 与 package.json
+      # 不同步而失败，则删 lock 改用 npm install 重新解析兜底（CI 工作区是临时的，不影响仓库）。
+      # 注：早前一次 exit 16 的失败并非依赖问题，而是 build.sh 里 zip 命令 -x 参数顺序错误（已修复）。
+      - name: 安装前端依赖（npm ci，确定性安装）
         run: |
           cd frontend
           npm ci --no-audit --no-fund || {
