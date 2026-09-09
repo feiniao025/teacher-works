@@ -28,11 +28,47 @@ const GRADING_TIMEOUT_MS = Number(process.env.AI_GRADING_TIMEOUT_MS) || 900000;
 const STREAM_IDLE_TIMEOUT_MS = Number(process.env.AI_STREAM_IDLE_TIMEOUT_MS) || 300000;
 
 // 「思考失控保护」兜底阈值（字符数）：流式返回时，若思考(reasoning)累计超过此字数、而答案正文(content)
-// 仍为空，判定模型陷入失控推理（实测某些本地推理模型在整卷上会思考数万字却始终不作答），提前中止以免长时间空转。
-// default 思考模式用此很高的兜底值（仅防真正无限空转，不误伤「长思考后正常作答」）；
-// suppress 思考模式改用供应商配置的 reasoning_limit（更紧，见 normalizeProvider 默认 15000）。
-// 可用环境变量 AI_REASONING_RUNAWAY_LIMIT 覆盖 default 模式兜底值。
-const REASONING_RUNAWAY_DEFAULT = Number(process.env.AI_REASONING_RUNAWAY_LIMIT) || 40000;
+// 仍为空，判定模型陷入失控推理，提前中止以免长时间空转。
+//
+// 重要：该保护**默认只在用户主动选择「限制思考 / 关闭思考」时生效**（用供应商配置的 reasoning_limit）。
+// 「跟随模型(default)」模式默认 0 = 不限思考长度，理由：
+//   ① 平台对接收长度本就没有限制（流式读取无上限），思考长只是多占一点内存、页面也不展示；
+//   ② 平台未下发 max_tokens 时，模型迟早会输出正文，中途掐断等于白等十几分钟、整单作废——
+//      这正是「模型明明正常生成却被客户端断开」的根因；
+//   ③ 仍需兜底时改由「流式总时长上限」负责，语义更直白（等太久，而不是想太多）。
+// 故此处默认 0（关闭）。可用环境变量 AI_REASONING_RUNAWAY_LIMIT 显式设置一个正数启用。
+const REASONING_RUNAWAY_DEFAULT = process.env.AI_REASONING_RUNAWAY_LIMIT !== undefined
+  ? Number(process.env.AI_REASONING_RUNAWAY_LIMIT) || 0
+  : 0;
+// 「限制思考 / 关闭思考」模式下思考上限的缺省值（字符）：用户未填时使用
+const REASONING_LIMIT_FALLBACK = Number(process.env.AI_REASONING_LIMIT_FALLBACK) || 15000;
+
+// 「放宽重试」开关：模型因平台下发的 max_tokens 上限被截断（思考占满额度、正文为空）时，
+// 自动以「不限制 max_tokens + 抑制思考」再试一次。
+// 设计依据：max_tokens 的语义是「要求模型最多生成多少」，是给模型的约束，而不是平台拒绝
+// 接收数据的理由——平台侧对接收长度本就没有限制（流式读取无上限），思考过程长一些只是多占
+// 一点内存、页面也不展示，不应因此让整个批改任务失败。
+// 只在「原本会直接失败」时触发，不会改变任何成功路径的行为。可用环境变量关闭。
+const AUTO_RELAX_RETRY = process.env.AI_GRADING_AUTO_RELAX_RETRY !== '0';
+// 放宽重试时的思考上限（字符）：比 suppress 模式的默认值更宽松，避免重试仍被思考保护中止
+const RELAX_REASONING_LIMIT = Number(process.env.AI_GRADING_RELAX_REASONING_LIMIT) || 80000;
+// 单次批改的图片总体积上限（MB）：base64 会再膨胀约 33%，设上限避免请求体与内存暴涨
+const MAX_TOTAL_IMAGE_MB = Number(process.env.AI_GRADING_MAX_TOTAL_MB) || 40;
+// 流式调用的「总时长上限」兜底：空闲超时只在「完全无输出」时生效，若模型持续缓慢吐字则可能
+// 长时间不结束。本地 9B 推理模型实测单次整卷约 15~20 分钟，故默认放宽到 45 分钟；
+// 思考越长越慢，真正想提速应从「关闭思考 / 减少图片张数」入手，而不是掐断长思考。
+const STREAM_TOTAL_TIMEOUT_MS = Number(process.env.AI_GRADING_STREAM_TOTAL_TIMEOUT_MS) || 2700000;
+// 传给模型的「试卷题目参考」最大字符数：按行截断并明确标注省略，避免只给了前半卷导致漏题
+const EXAM_REFERENCE_MAX_CHARS = Number(process.env.AI_GRADING_EXAM_REF_CHARS) || 6000;
+// 支持的图片扩展名白名单：不在名单内（如 iPhone 的 HEIC）明确报错，而不是兜底成 jpeg 静默出错
+const SUPPORTED_IMAGE_MIME = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.bmp': 'image/bmp'
+};
 
 // 模型服务商预设：前端选择后自动回填 base_url / model，用户仍可自由修改
 const PROVIDER_PRESETS = [
@@ -85,13 +121,23 @@ const DEFAULT_SYSTEM_PROMPT = `你是一名严谨、经验丰富的小学教师�
 3. 汇总学生总得分与试卷满分；
 4. 给出总体评语，指出主要问题与改进建议。
 
+题目拆分与完整性要求（非常重要）：
+- 按「最小计分单位」逐条拆分：若一个大题包含多个小题（如填空题的每个空、计算/解答题的 (1)(2)(3)、选择题的每个选项、判断题的每题），必须把每个小题作为 questions 数组中独立的一条，不要把多个小题合并成一条；
+- 题号 no 用「大题号-小题号」的形式区分（如 "三-1"、"三-2"；大题本身不含小题时直接用 "1" 或 "一"）；
+- 务必覆盖图片中所有可见题目，从第一题到最后一题逐一输出，不得遗漏、不得跳题、不得只挑选部分题目批改；
+- 若某大题确实无法再拆分（如一篇作文、一次整体作答），作为一条输出即可。
+
 判分要求：
 - 只依据图片中可见的作答内容判分，无法辨认或未作答的题目按 0 分处理，并在该题点评中说明；
 - 客观题按对错判分，主观题按要点给分，允许给出部分分；
+- 若试卷未标注总分，一律按 100 分制估算各题满分；无法确定单题满分时按常见分值合理分配；
 - 保持严格、公正，分数为数字，不要带单位。
 
 输出要求（非常重要）：
 - 必须严格输出一个 JSON 对象，不要输出任何解释性文字、前后缀或 Markdown 代码块；
+- questions 数组的每个元素对应一个「最小计分单位」（即一个小题）；total_score 应等于各题 score 之和、full_score 应等于各题 full_score 之和；
+- 即使某题在图片中模糊、被遮挡或学生未作答，也要在 questions 中列出该题并把 result 标记为 blank、score 记为 0，不得省略；
+- 请直接输出答案 JSON，不要为节省篇幅而省略任何题目；
 - JSON 结构如下：
 {
   "full_score": 数字,            // 试卷满分，无法确定时用各题满分之和
@@ -99,7 +145,7 @@ const DEFAULT_SYSTEM_PROMPT = `你是一名严谨、经验丰富的小学教师�
   "overall_comment": "总体评语",
   "questions": [
     {
-      "no": "题号",              // 如 "1" 或 "一"
+      "no": "题号",              // 大题无小题时如 "1"/"一"；含小题时用 "大题号-小题号"，如 "三-1"
       "question": "题目内容摘要",
       "student_answer": "识别到的学生作答内容",
       "score": 数字,             // 本题得分
@@ -118,6 +164,31 @@ function num(v, fallback = 0) {
 
 function str(v) {
   return v === null || v === undefined ? '' : String(v);
+}
+
+// 保留两位小数：避免浮点累加误差（0.1+0.2 之类）被误判为「总分与逐题合计不一致」
+function round2(n) {
+  const v = Number(n);
+  return Number.isFinite(v) ? Math.round(v * 100) / 100 : 0;
+}
+
+// 由分值推导判定结果：仅在模型给出的 result 缺失（unknown）或与分值明显矛盾时兜底使用
+function deriveResult(q) {
+  if (q.full_score > 0) {
+    if (q.score >= q.full_score) return 'correct';
+    if (q.score <= 0) return str(q.student_answer).trim() ? 'wrong' : 'blank';
+    return 'partial';
+  }
+  if (q.score > 0) return 'partial';
+  return str(q.student_answer).trim() ? 'wrong' : 'blank';
+}
+
+// result 与分值是否明显矛盾（仅在 full_score > 0 时调用，避免无满分信息时误判）
+function contradictsResult(result, score, fullScore) {
+  if (result === 'correct' && score < fullScore) return true;
+  if ((result === 'wrong' || result === 'blank') && score >= fullScore) return true;
+  if (result === 'blank' && score > 0) return true;
+  return false;
 }
 
 function normalizeResult(v) {
@@ -152,49 +223,68 @@ function buildEndpointCandidates(baseUrl) {
   return candidates;
 }
 
+// 按扩展名返回 mime；不在白名单内返回空串（由调用方给出明确的中文报错），
+// 不再兜底成 image/jpeg——否则 iPhone 的 HEIC 会被静默当作 jpeg 发出，最终只得到一次无意义的失败
 function mimeOf(filePath) {
-  const ext = path.extname(filePath).toLowerCase();
-  const map = {
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.png': 'image/png',
-    '.webp': 'image/webp',
-    '.gif': 'image/gif',
-    '.bmp': 'image/bmp'
-  };
-  return map[ext] || 'image/jpeg';
+  return SUPPORTED_IMAGE_MIME[path.extname(filePath).toLowerCase()] || '';
 }
 
 // 读取本地图片文件转为 base64 data URL（OpenAI 兼容端点内联传图方式）
 // 用异步读取，避免大图 readFileSync 阻塞事件循环（影响轮询等其它请求）
 async function imageToDataUrl(absPath) {
+  const mime = mimeOf(absPath);
+  if (!mime) {
+    const ext = path.extname(absPath).toLowerCase() || '未知格式';
+    throw new Error(`不支持的图片格式（${ext}）：请转换为 JPG / PNG 后重试。iPhone 拍摄的 HEIC 请在「设置-相机-格式」中改为「兼容性最佳」，或先另存为 JPG`);
+  }
   let buf;
   try {
     buf = await fs.promises.readFile(absPath);
   } catch (e) {
     throw new Error(`图片文件不存在或无法读取：${path.basename(absPath)}`);
   }
-  return `data:${mimeOf(absPath)};base64,${buf.toString('base64')}`;
+  return `data:${mime};base64,${buf.toString('base64')}`;
 }
 
 // ---------- 消息构建 ----------
-function buildUserText(examContext = {}) {
+// 按行截断：试卷题目参考通常是「每行一题」的纯文本，按字符硬截断会把某一行从中间劈开，
+// 这里整行保留/整行丢弃，并明确告知模型后续被省略，避免它以为试卷只有这些题而漏批后半卷
+function truncateByLines(text, maxChars) {
+  const s = str(text);
+  if (s.length <= maxChars) return s;
+  const out = [];
+  let len = 0;
+  for (const line of s.split('\n')) {
+    if (out.length && len + line.length + 1 > maxChars) break;
+    out.push(line);
+    len += line.length + 1;
+  }
+  const head = out.join('\n');
+  if (!head) return s.slice(0, maxChars) + '\n…（内容过长已截断）';
+  return head + '\n…（后续题目略，请以图片实际内容为准，不要因此少批题目）';
+}
+
+function buildUserText(examContext = {}, imageCount = 0) {
   const lines = ['请批改这张（或这组）试卷图片，并按系统提示词要求输出 JSON。'];
+  // 多图时显式声明页序：模型默认不会推断「第几张是第几页」
+  if (imageCount > 1) {
+    lines.push(`共 ${imageCount} 张图片，按第 1 张到第 ${imageCount} 张的顺序即为试卷页序，请完整批改每一页的所有题目。`);
+  }
   if (examContext.title) lines.push(`试卷标题：${examContext.title}`);
   if (examContext.subject) lines.push(`科目：${examContext.subject}`);
   if (examContext.content) {
     lines.push('试卷题目参考（可能不完整，请以图片实际内容为准）：');
-    lines.push(str(examContext.content).slice(0, 2000));
+    lines.push(truncateByLines(examContext.content, EXAM_REFERENCE_MAX_CHARS));
   }
   return lines.join('\n');
 }
 
 function buildGradingMessages(config, imageDataUrls, examContext) {
   const system = (config.system_prompt && String(config.system_prompt).trim()) || DEFAULT_SYSTEM_PROMPT;
-  let userText = buildUserText(examContext);
+  let userText = buildUserText(examContext, Array.isArray(imageDataUrls) ? imageDataUrls.length : 0);
   // 「抑制思考」：追加 Qwen3 系软开关 /no_think 与简洁作答提示。对支持的模型（云端 Qwen3 等）可直接关闭思考；
   // 对忽略该开关的本地模型无害——真正的兜底是 postChatStream 里的「思考失控保护」。
-  if (config.thinking_mode === 'suppress') {
+  if (resolveThinkingMode(config) === 'suppress') {
     userText += '\n请简洁思考、尽快直接输出最终 JSON 答案，不要展开冗长推理。 /no_think';
   }
   const content = [{ type: 'text', text: userText }];
@@ -224,7 +314,7 @@ function extractJsonText(text) {
 
 function normalizeQuestion(q, i) {
   if (!q || typeof q !== 'object') return null;
-  return {
+  return finalizeQuestion({
     no: str(q.no ?? q.number ?? q.index ?? q['题号'] ?? i + 1),
     question: str(q.question ?? q.title ?? q['题目'] ?? ''),
     student_answer: str(q.student_answer ?? q.answer ?? q['学生答案'] ?? q['作答'] ?? ''),
@@ -232,7 +322,23 @@ function normalizeQuestion(q, i) {
     full_score: num(q.full_score ?? q.max_score ?? q.fullscore ?? q['满分'], 0),
     result: normalizeResult(q.result ?? q.status ?? q['结果']),
     comment: str(q.comment ?? q.feedback ?? q['点评'] ?? q['评语'] ?? '')
-  };
+  });
+}
+
+// 单题结果收敛：分数约束到 [0, 满分]，判定与分值矛盾时按分值纠正。
+// 模型偶有给出负分、超满分分值，或判 correct 却给 0 分，直接展示/采纳都会造成明显错误。
+function finalizeQuestion(q) {
+  let score = num(q.score, 0);
+  let full = num(q.full_score, 0);
+  if (full > 0) score = Math.min(Math.max(score, 0), full);
+  else if (score < 0) score = 0;
+  q.score = round2(score);
+  q.full_score = full > 0 ? round2(full) : 0;
+  // 仅在「判定缺失」或「与分值明显矛盾」时纠正，其余保留模型原判
+  if (q.result === 'unknown' || (q.full_score > 0 && contradictsResult(q.result, q.score, q.full_score))) {
+    q.result = deriveResult(q);
+  }
+  return q;
 }
 
 // 尝试修复 LLM 常见的 JSON 小错误（不改语义、只做安全修补）：
@@ -303,17 +409,39 @@ function salvageGradingResult(text) {
   };
 }
 
-// 由已解析对象构建标准批改结果
+// 由已解析对象构建标准批改结果。
+// 关键点：模型自报的 total_score / full_score 与逐题明细经常对不上（算错加法是高频现象），
+// 而这个分数会被「采纳」直接写进成绩册。逐题明细在页面上逐条可见、可人工核对，
+// 因此以逐题合计为准，并把修正动作写进总评，做到「改了什么、为什么改」可追溯。
 function buildResultFromObject(obj) {
   const questions = Array.isArray(obj.questions)
     ? obj.questions.map(normalizeQuestion).filter(Boolean)
     : [];
-  const sumFull = questions.reduce((s, q) => s + q.full_score, 0);
-  const sumScore = questions.reduce((s, q) => s + q.score, 0);
+  const sumFull = round2(questions.reduce((s, q) => s + q.full_score, 0));
+  const sumScore = round2(questions.reduce((s, q) => s + q.score, 0));
+  let totalScore = round2(num(obj.total_score ?? obj.score, sumScore));
+  let fullScore = round2(num(obj.full_score ?? obj.max_score, sumFull));
+  const notes = [];
+  if (questions.length) {
+    if (Math.abs(totalScore - sumScore) > 0.01) {
+      notes.push(`AI 自报总分 ${totalScore} 与逐题合计 ${sumScore} 不一致，已按逐题合计修正`);
+      totalScore = sumScore;
+    }
+    // 只有每题都给出了满分时才校准总分，避免「模型给了总分但没给单题满分」时被误改成 0
+    const allHaveFull = questions.every((q) => q.full_score > 0);
+    if (allHaveFull && Math.abs(fullScore - sumFull) > 0.01) {
+      notes.push(`AI 自报满分 ${fullScore} 与逐题满分合计 ${sumFull} 不一致，已按逐题合计修正`);
+      fullScore = sumFull;
+    }
+  }
+  let overall = str(obj.overall_comment ?? obj.comment ?? obj['总评'] ?? '');
+  if (notes.length) {
+    overall = (overall ? overall + '\n\n' : '') + '【系统提示】' + notes.join('；') + '，请核对后采用。';
+  }
   return {
-    full_score: num(obj.full_score ?? obj.max_score, sumFull),
-    total_score: num(obj.total_score ?? obj.score, sumScore),
-    overall_comment: str(obj.overall_comment ?? obj.comment ?? obj['总评'] ?? ''),
+    full_score: fullScore,
+    total_score: totalScore,
+    overall_comment: overall,
     questions
   };
 }
@@ -401,7 +529,7 @@ function postChatOnce(url, headers, bodyStr, timeoutMs) {
 //       ③ 实时回调 onProgress，让前端显示「思考中/作答中，已生成 N 字」。
 // 兼容降级：若服务端并非 SSE（返回普通 JSON——不支持 stream、或漏填 /v1 被兜底成错误），
 //          以 {kind:'buffered', status, ok, text} 返回，交由 interpretChatResponse 统一判定/换端点。
-function postChatStream(url, headers, bodyStr, { idleTimeoutMs = 180000, onProgress = null, reasoningLimit = 0 } = {}) {
+function postChatStream(url, headers, bodyStr, { idleTimeoutMs = 180000, totalTimeoutMs = STREAM_TOTAL_TIMEOUT_MS, onProgress = null, reasoningLimit = 0 } = {}) {
   return new Promise((resolve, reject) => {
     let u;
     try {
@@ -413,30 +541,43 @@ function postChatStream(url, headers, bodyStr, { idleTimeoutMs = 180000, onProgr
     const lib = u.protocol === 'https:' ? https : http;
     const buf = Buffer.from(bodyStr, 'utf8');
     const startedAt = Date.now();
-    let timer = null;
+    let idleTimer = null;
+    let totalTimer = null;
     let settled = false;
-    const settle = (fn, arg) => {
-      if (settled) return;
-      settled = true;
-      if (timer) { clearTimeout(timer); timer = null; }
-      fn(arg);
-    };
-    // 空闲计时：每收到一块数据就重置；到点仍无数据则判定服务卡死并 destroy
-    const resetIdle = () => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(() => {
-        const err = new Error(`模型已 ${Math.round(idleTimeoutMs / 1000)}s 无任何输出`);
-        err.name = 'AbortError';
-        req.destroy(err);
-      }, idleTimeoutMs);
-    };
-
     let content = '';
     let reasoning = '';
     let finishReason = '';
     let lineBuf = '';
     let lastEmit = 0;
     const rawChunks = []; // 非 SSE 时缓存完整响应体
+
+    const settle = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+      if (totalTimer) { clearTimeout(totalTimer); totalTimer = null; }
+      fn(arg);
+    };
+    // 中断（空闲超时 / 总时长上限 / 思考失控）统一走这里：
+    // 把「已经收到的正文与思考」挂到错误对象上再 reject——平台对接收长度本就没有限制，
+    // 模型既然已经生成了内容，就不该因为一次中断而整单丢弃；能否打捞由上层决定。
+    const abortWith = (message, name) => {
+      const err = new Error(message);
+      err.name = name;
+      err.partialContent = content;
+      err.partialReasoning = reasoning;
+      // 这三类中断多与「输出长度额度」有关，放宽上限后重试有较大概率成功
+      err.relaxable = true;
+      settle(reject, err);
+      try { req.destroy(); } catch (e) { /* 已 settle，销毁结果无影响 */ }
+    };
+    // 空闲计时：每收到一块数据就重置；到点仍无数据则判定服务卡死
+    const resetIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        abortWith(`模型已 ${Math.round(idleTimeoutMs / 1000)}s 无任何输出`, 'AbortError');
+      }, idleTimeoutMs);
+    };
 
     const emitProgress = (force) => {
       if (!onProgress) return;
@@ -450,7 +591,11 @@ function postChatStream(url, headers, bodyStr, { idleTimeoutMs = 180000, onProgr
       const text = stage === 'answering'
         ? `模型正在作答…已生成 ${cChars} 字（用时 ${elapsed}s）`
         : stage === 'thinking'
-          ? `模型正在思考…已生成 ${rChars} 字（用时 ${elapsed}s）`
+          // 思考超过 3 分钟时顺带给出可操作建议：长思考本身不会让任务失败（平台不限接收长度），
+          // 但会显著拉长等待，关闭思考通常能把十几分钟压到几分钟。
+          ? (elapsed >= 180
+            ? `模型正在思考…已生成 ${rChars} 字（用时 ${elapsed}s）——思考较久，若想提速可在「AI 模型配置」中把思考模式改为「关闭思考」`
+            : `模型正在思考…已生成 ${rChars} 字（用时 ${elapsed}s）`)
           : `已连接模型，等待输出…（用时 ${elapsed}s）`;
       try {
         onProgress({ stage, reasoning_chars: rChars, content_chars: cChars, chars: rChars + cChars, elapsed_seconds: elapsed, text });
@@ -496,11 +641,17 @@ function postChatStream(url, headers, bodyStr, { idleTimeoutMs = 180000, onProgr
             // 思考失控保护：思考(reasoning)已超上限、而答案正文(content)仍为空 => 判定失控，提前中止。
             // 仅在「有思考、无答案」时触发；一旦开始产出正文即不再干预，故正常的长思考后作答不会被误杀。
             if (reasoningLimit > 0 && content.length === 0 && reasoning.length >= reasoningLimit) {
-              const err = new Error(`模型思考已超过 ${reasoningLimit} 字仍未开始作答`);
-              err.name = 'ReasoningRunaway';
               emitProgress(true);
-              settle(reject, err); // 先确定性地以该错误 reject，避免被随后的 socket 错误覆盖
-              req.destroy();       // 再销毁底层请求，停止接收
+              // 早停打捞：推理型模型常把完整答案写在思考里，此时没必要再等它重输出到正文——
+              // 直接带着思考过程结束，由上层从思考中提取答案并标注来源，省下重复生成的时间。
+              // recoverFromReasoning 要求文本里确有 questions/total_score 且首尾花括号完整，
+              // 不会把半截思考草稿误当成答案。
+              if (recoverFromReasoning(reasoning)) {
+                settle(resolve, { kind: 'streamed', content, reasoning, finish_reason: 'length', earlyStop: true });
+                try { req.destroy(); } catch (e) { /* 已 settle，销毁结果无影响 */ }
+                return;
+              }
+              abortWith(`模型思考已超过 ${reasoningLimit} 字仍未开始作答`, 'ReasoningRunaway');
               return;
             }
           }
@@ -514,8 +665,32 @@ function postChatStream(url, headers, bodyStr, { idleTimeoutMs = 180000, onProgr
     );
     req.on('error', (e) => settle(reject, e));
     resetIdle(); // 启动首个空闲计时，覆盖「连接 + 首字节」等待
+    // 总时长上限兜底：与空闲超时互补——空闲超时防「卡死不吐字」，总时长防「极慢地一直吐字」。
+    // 默认 30 分钟，远超实测的整卷批改耗时，正常批改不会被触发。
+    totalTimer = setTimeout(() => {
+      abortWith(`批改总时长已超过 ${Math.round(totalTimeoutMs / 60000)} 分钟，已停止等待`, 'AbortError');
+    }, totalTimeoutMs);
     req.end(buf);
   });
+}
+
+// 思考模式归一：default=跟随模型（不干预）；limited=允许思考但限长；suppress=尽力关闭思考。
+// 未知值一律按 default 处理，保证既有配置行为不变。
+function resolveThinkingMode(config) {
+  const m = config && config.thinking_mode;
+  if (m === 'suppress') return 'suppress';
+  if (m === 'limited') return 'limited';
+  return 'default';
+}
+
+// 思考上限（字符）：仅 limited / suppress 模式读取配置值；default 模式不看该值——
+// 存量配置里 reasoning_limit 多为 15000，若 default 也生效会让原本能跑完的长思考被突然掐断（回归）。
+function resolveReasoningLimit(config) {
+  if (resolveThinkingMode(config) === 'default') return REASONING_RUNAWAY_DEFAULT;
+  const raw = config && config.reasoning_limit;
+  if (raw === undefined || raw === null || raw === '') return REASONING_LIMIT_FALLBACK;
+  const v = Number(raw);
+  return v > 0 ? v : 0; // 0 = 不限思考长度（只受「流式总时长上限」兜底）
 }
 
 // 组装请求体：max_tokens 是「要求模型最多生成多少」的上限，并非本服务作为接收端的限制。
@@ -530,28 +705,60 @@ function buildRequestBody(config, messages, stream) {
   };
   const mt = num(config.max_tokens, 0);
   if (mt > 0) body.max_tokens = mt;
-  // 「抑制思考」的 best-effort 硬开关：HF 模板系服务端（vLLM / SGLang / 较新 llama.cpp）据此关闭思考。
-  // 实测本机 LM Studio 会忽略该字段（无害），此时改由「思考失控保护」兜底；云端 Qwen3 等则可真正生效。
-  if (config.thinking_mode === 'suppress') {
-    body.chat_template_kwargs = { enable_thinking: false };
+  const mode = resolveThinkingMode(config);
+  if (mode !== 'default') {
+    // 关闭/限制思考的 best-effort 下发：均为「服务端支持才生效、不支持则忽略」的附加字段，
+    // 不改变 OpenAI 兼容协议的标准部分，故对不支持的服务端无副作用。
+    const kwargs = {};
+    if (mode === 'suppress') {
+      // HF 模板系硬开关：vLLM / SGLang / llama.cpp(--chat-template-kwargs) / 云端 Qwen3 均据此关闭思考；
+      // LM Studio 需模型 yaml 暴露 enableThinking 自定义字段才生效，否则被忽略（此时由思考上限兜底）。
+      kwargs.enable_thinking = false;
+      // LM Studio 自定义字段命名（model.yaml 的 enableThinking），与上方互补
+      body.enableThinking = false;
+    }
+    // 思考预算：部分模板（Seed-OSS / vLLM 系）据此限制思考长度；不支持的模板会忽略未定义变量。
+    const budget = num(config.reasoning_limit, 0);
+    if (budget > 0) kwargs.thinking_budget = budget;
+    if (Object.keys(kwargs).length) body.chat_template_kwargs = kwargs;
   }
   return JSON.stringify(body);
 }
 
 // 依据「正文 + finish_reason」判定结果，非流式与流式两条路径共用同一套判定：
 // 只要有非空正文就采用；正文为空且 finish_reason=length 判为截断；否则为无效正文。
-const MSG_TRUNCATED = '模型输出被截断：思考过程(reasoning)占满了「最大 Tokens」额度，未来得及输出答案正文。请在供应商配置中关闭「限制 Tokens」（即不限制输出长度），或将其调大后重试';
+const MSG_TRUNCATED_PLATFORM = '模型输出被截断：思考过程(reasoning)占满了平台下发的「最大 Tokens」额度，未来得及输出答案正文。系统会自动放宽长度限制重试一次；若仍失败，请在供应商配置中关闭「限制 Tokens」';
+const MSG_TRUNCATED_MODEL = '模型输出被截断：平台并未限制输出长度，是模型自身的生成/上下文上限导致答案未完整输出。建议减少单次上传的图片数量、分批批改，或更换上下文更长的模型';
 const MSG_EMPTY = '模型未返回有效正文（content 为空）。可能触发了内容过滤、图片无法识别或输出被截断，请重试、更换模型，或关闭「限制 Tokens」';
-function decideFromContentAndReason(contentText, finishReason) {
+
+// 构造失败错误；relaxable 标记该失败是否值得「放宽 max_tokens 重试」
+function makeFatalError(message, { relaxable = false, partialReasoning = '' } = {}) {
+  const err = new Error(message);
+  err.relaxable = relaxable;
+  if (partialReasoning) err.partialReasoning = partialReasoning;
+  return err;
+}
+
+// 依据「正文 + finish_reason」判定结果，非流式与流式两条路径共用同一套判定：
+// 只要有非空正文就采用；正文为空时按截断/异常处理，并把已收到的思考过程一并带回。
+// limitedByPlatform：平台是否下发了 max_tokens 上限——只有这种情况「放宽重试」才有意义。
+function decideFromContentAndReason(contentText, finishReason, reasoningText = '', limitedByPlatform = false) {
   if (contentText && contentText.trim()) return { kind: 'content', value: contentText };
-  if (finishReason === 'length') return { kind: 'fatal', error: new Error(MSG_TRUNCATED) };
-  return { kind: 'fatal', error: new Error(MSG_EMPTY) };
+  const truncMsg = limitedByPlatform ? MSG_TRUNCATED_PLATFORM : MSG_TRUNCATED_MODEL;
+  // 正文为空但思考过程非空：把思考内容挂在错误上，交由上层决定「放宽重试」还是「从思考中打捞答案」
+  if (str(reasoningText).trim()) {
+    return { kind: 'fatal', error: makeFatalError(truncMsg, { relaxable: limitedByPlatform, partialReasoning: str(reasoningText) }) };
+  }
+  if (finishReason === 'length') {
+    return { kind: 'fatal', error: makeFatalError(truncMsg, { relaxable: limitedByPlatform }) };
+  }
+  return { kind: 'fatal', error: makeFatalError(MSG_EMPTY, { relaxable: limitedByPlatform }) };
 }
 
 // 判定一次响应的结果：
 //   content -> 命中有效正文；miss -> 端点/路由未命中（可换下一候选，如补 /v1）；
 //   fatal   -> 明确失败（鉴权/截断/结构异常等），不应再换端点重试。
-function interpretChatResponse({ status, ok, text }) {
+function interpretChatResponse({ status, ok, text }, { limitedByPlatform = false } = {}) {
   if (!ok) {
     let detail = str(text).slice(0, 400);
     try {
@@ -582,22 +789,23 @@ function interpretChatResponse({ status, ok, text }) {
   let bodyText = '';
   if (typeof content === 'string') bodyText = content;
   else if (Array.isArray(content)) bodyText = content.map((c) => c?.text || '').join('');
-  return decideFromContentAndReason(bodyText, choice?.finish_reason);
+  return decideFromContentAndReason(bodyText, choice?.finish_reason, '', limitedByPlatform);
 }
 
-// 调用 Chat Completions：按 buildEndpointCandidates 依次尝试候选端点，命中“端点未识别”
+// 调用 Chat Completions 的「单次尝试」：按 buildEndpointCandidates 依次尝试候选端点，命中“端点未识别”
 // 时自动换下一个（例如用户漏填 /v1）；其余错误（超时/网络/鉴权/截断）如实抛出。
-async function callChatCompletion(config, messages, { timeoutMs = 180000, idleTimeoutMs = STREAM_IDLE_TIMEOUT_MS, onProgress = null, stream, reasoningLimit } = {}) {
+async function callChatAttempt(config, messages, { timeoutMs = 180000, idleTimeoutMs = STREAM_IDLE_TIMEOUT_MS, onProgress = null, stream, reasoningLimit } = {}) {
   const candidates = buildEndpointCandidates(config.base_url);
   const headers = { 'Content-Type': 'application/json' };
   if (config.api_key) headers['Authorization'] = `Bearer ${config.api_key}`;
+  // 平台是否下发了 max_tokens 上限：决定截断类失败值不值得放宽重试
+  const limitedByPlatform = num(config.max_tokens, 0) > 0;
   // 默认启用流式（config.stream !== false）：实时进度 + 空闲超时守护，避免慢速推理模型长等待被误杀
   const useStream = stream !== undefined ? !!stream : (config.stream !== false);
-  // 思考失控保护阈值：显式传入优先；否则 suppress 模式用供应商 reasoning_limit（默认 15000，0=关闭），
-  // default 模式用很高的兜底值（仅防真正无限空转）。仅对流式生效（非流式由总时长超时兜底）。
-  const rLimit = reasoningLimit !== undefined
-    ? reasoningLimit
-    : (config.thinking_mode === 'suppress' ? num(config.reasoning_limit, 15000) : REASONING_RUNAWAY_DEFAULT);
+  // 思考失控保护阈值（字符）：显式传入优先（放宽重试时用更宽松的值）；否则按思考模式解析——
+  // default 默认 0（不限制，避免把正常长思考掐断），limited / suppress 用供应商 reasoning_limit。
+  // 0 表示「不限思考长度」，只由流式总时长上限兜底。仅对流式生效（非流式由总时长超时兜底）。
+  const rLimit = reasoningLimit !== undefined ? reasoningLimit : resolveReasoningLimit(config);
   const bodyStr = buildRequestBody(config, messages, useStream);
 
   const deadline = Date.now() + timeoutMs; // 多候选共享一个总超时（主要用于非流式与换端点重试）
@@ -612,23 +820,32 @@ async function callChatCompletion(config, messages, { timeoutMs = 180000, idleTi
     try {
       if (useStream) {
         const r = await postChatStream(candidates[i], headers, bodyStr, { idleTimeoutMs, onProgress, reasoningLimit: rLimit });
-        // 正常 SSE：用累积的正文 + finish_reason 判定；服务端未按 SSE 返回（不支持 stream /
-        // 漏填 /v1 被兜底成错误 JSON）则以 buffered 交 interpret 统一处理，仍能走 /v1 换端点重试
+        // 正常 SSE：用累积的正文 + finish_reason 判定（思考过程一并传入，供正文为空时打捞）；
+        // 服务端未按 SSE 返回（不支持 stream / 漏填 /v1 被兜底成错误 JSON）则以 buffered
+        // 交 interpret 统一处理，仍能走 /v1 换端点重试
         outcome = r.kind === 'streamed'
-          ? decideFromContentAndReason(r.content, r.finish_reason)
-          : interpretChatResponse(r);
+          ? decideFromContentAndReason(r.content, r.finish_reason, r.reasoning, limitedByPlatform)
+          : interpretChatResponse(r, { limitedByPlatform });
+        // 早停打捞：思考里已确认存在完整答案，此时再「放宽上限重试」只是重复等待一轮，
+        // 直接交给上层的思考打捞逻辑即可（结果会标注来源，提醒人工核对）。
+        if (r.earlyStop && outcome.kind === 'fatal' && outcome.error) outcome.error.relaxable = false;
       } else {
         const r = await postChatOnce(candidates[i], headers, bodyStr, remaining);
-        outcome = interpretChatResponse(r);
+        outcome = interpretChatResponse(r, { limitedByPlatform });
       }
     } catch (e) {
+      // 中断类错误（AbortError / ReasoningRunaway）已携带 partialContent / partialReasoning /
+      // relaxable，这里只重写用户可读的建议文案，**必须原样抛出**以保留这些字段，
+      // 否则上层就无法「用已收到的内容兜底」或「放宽上限重试」。
       if (e && e.name === 'ReasoningRunaway') {
-        throw new Error(`模型思考失控：已生成超过 ${rLimit} 字的思考仍未开始作答，已提前中止以避免长时间空转。建议：减少单次上传的图片数量、将「思考模式」设为「抑制思考」并调低「思考上限」、或更换更快/非推理型模型`);
+        e.message = `模型思考失控：已生成超过 ${rLimit} 字的思考仍未开始作答，已提前中止以避免长时间空转。建议：减少单次上传的图片数量、将「思考模式」设为「抑制思考」并调低「思考上限」、或更换更快/非推理型模型`;
+        throw e;
       }
       if (e && e.name === 'AbortError') {
-        throw new Error(useStream
-          ? `批改超时：模型已 ${Math.round(idleTimeoutMs / 1000)}s 无任何输出，可能已停止响应或网络中断。请重试；若持续如此，可减少单次上传的图片数量或改用更快的模型`
-          : `批改超时：模型在 ${Math.round(timeoutMs / 60000)} 分钟内未返回完整结果。建议开启「流式响应」以获取实时进度并避免长等待超时、减少单次上传的图片数量，或改用更快的模型`);
+        e.message = useStream
+          ? `批改超时：${e.message}，可能已停止响应或网络中断。请重试；若持续如此，可减少单次上传的图片数量或改用更快的模型`
+          : `批改超时：模型在 ${Math.round(timeoutMs / 60000)} 分钟内未返回完整结果。建议开启「流式响应」以获取实时进度并避免长等待超时、减少单次上传的图片数量，或改用更快的模型`;
+        throw e;
       }
       // 连接层错误（ECONNREFUSED / ENOTFOUND / ECONNRESET 等）统一成友好提示
       throw new Error(`无法连接模型服务：${e && e.message ? e.message : String(e)}`);
@@ -643,6 +860,93 @@ async function callChatCompletion(config, messages, { timeoutMs = 180000, idleTi
   throw new Error('调用模型失败');
 }
 
+// 判断一段文本里是否已有可用的答案 JSON：用于判断「中断时已收到的部分正文」值不值得采用，
+// 避免出现「只有几个字符的残片」也被当成结果。
+function looksLikeAnswer(text) {
+  const s = str(text);
+  if (!s.trim() || s.indexOf('{') < 0) return false;
+  return /"questions"\s*:/.test(s) || /"total_score"\s*:/.test(s);
+}
+
+// 从模型的「思考过程」中尽力提取答案 JSON：推理型模型常在思考里就把完整答案写出来了，
+// 只是最终没来得及输出到正文。要求确实出现 questions / total_score 关键词，避免把无关思考当答案。
+function recoverFromReasoning(reasoningText) {
+  const s = str(reasoningText);
+  if (!s.trim()) return null;
+  if (!/"questions"\s*:/.test(s) && !/"total_score"\s*:/.test(s)) return null;
+  const start = s.indexOf('{');
+  const end = s.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  return s.slice(start, end + 1);
+}
+
+// 是否值得「放宽上限重试」：只有平台自己下发了 max_tokens、且失败与长度/中断有关时才重试。
+// 若配置本就是「不限制」(max_tokens<=0)，重试只会重复撞模型自身上限，白白多等一轮。
+function shouldRelaxRetry(err, config, allowRelax) {
+  return !!(allowRelax && AUTO_RELAX_RETRY && err && err.relaxable && num(config.max_tokens, 0) > 0);
+}
+
+// 调用 Chat Completions（对外入口）。相比单次尝试，多了两级兜底，且**只作用于原本会失败的分支**：
+//   ① 中断时已收到可用的部分正文 -> 直接采用（模型返回多少就收多少，平台不设接收上限）；
+//   ② 平台自己设了 max_tokens 导致截断/失控 -> 自动以「不限制长度 + 抑制思考」重试一次；
+//   ③ 仍失败 -> 从模型的思考过程中打捞答案，并标记来源提醒人工核对。
+async function callChatCompletion(config, messages, opts = {}) {
+  const { allowRelax = true, state = null } = opts;
+  const tryPartial = (e) => (looksLikeAnswer(e && e.partialContent) ? str(e.partialContent) : null);
+  let err = null;
+  let retried = false;
+
+  try {
+    return await callChatAttempt(config, messages, opts);
+  } catch (e) {
+    err = e;
+  }
+
+  // ① 已有可用的部分正文：不再多等一轮
+  const partial = tryPartial(err);
+  if (partial) return partial;
+
+  // ② 平台自身的长度上限导致的失败：放宽后重试一次
+  if (shouldRelaxRetry(err, config, allowRelax)) {
+    retried = true;
+    const relaxed = { ...config, max_tokens: 0, thinking_mode: 'suppress' };
+    try {
+      return await callChatAttempt(relaxed, messages, { ...opts, reasoningLimit: RELAX_REASONING_LIMIT });
+    } catch (e2) {
+      err = e2;
+    }
+    const partial2 = tryPartial(err);
+    if (partial2) return partial2;
+  }
+
+  // ③ 从思考过程中打捞
+  const fromReasoning = recoverFromReasoning(err && err.partialReasoning);
+  if (fromReasoning) {
+    if (state) state.reasoning_sourced = true;
+    return fromReasoning;
+  }
+
+  throw new Error(retried
+    ? `${str(err && err.message)}（已自动放宽「最大 Tokens」并抑制思考重试一次，仍失败）`
+    : str(err && err.message));
+}
+
+// 图片总体积校验：base64 会再膨胀约 1/3，且全部读入内存后才发起请求，
+// 提前拦截可避免请求体与内存暴涨导致进程被杀（表现为整个服务不可用，影响面远大于本次批改）。
+async function assertImagesWithinLimit(absPaths) {
+  let total = 0;
+  for (const p of absPaths) {
+    try {
+      const st = await fs.promises.stat(p);
+      total += Number(st.size) || 0;
+    } catch (e) { /* 读不到时由 imageToDataUrl 给出明确提示，此处不重复报错 */ }
+  }
+  const limit = MAX_TOTAL_IMAGE_MB * 1024 * 1024;
+  if (total > limit) {
+    throw new Error(`试卷图片合计 ${(total / 1024 / 1024).toFixed(1)}MB，超过单次 ${MAX_TOTAL_IMAGE_MB}MB 上限（转 base64 后还会再膨胀约 1/3）。请压缩图片或减少单次上传张数后重试`);
+  }
+}
+
 // 批改主入口：config + 图片绝对路径数组 + 试卷上下文 -> 结构化批改结果
 async function gradePaper(config, imageAbsPaths, examContext = {}, onProgress = null) {
   if (!Array.isArray(imageAbsPaths) || imageAbsPaths.length === 0) {
@@ -651,14 +955,21 @@ async function gradePaper(config, imageAbsPaths, examContext = {}, onProgress = 
   if (!config || !config.model) {
     throw new Error('未配置模型名称（model）');
   }
+  await assertImagesWithinLimit(imageAbsPaths);
   const dataUrls = await Promise.all(imageAbsPaths.map(imageToDataUrl));
   const messages = buildGradingMessages(config, dataUrls, examContext);
+  // state 用于回传「结果是否来自思考过程打捞」，便于在总评里明确标注来源
+  const state = {};
   const raw = await callChatCompletion(config, messages, {
     timeoutMs: GRADING_TIMEOUT_MS,
     idleTimeoutMs: STREAM_IDLE_TIMEOUT_MS,
-    onProgress
+    onProgress,
+    state
   });
   const result = parseGradingResult(raw);
+  if (state.reasoning_sourced) {
+    result.overall_comment = '【系统提示】模型未输出正式答案，本结果提取自其思考过程，可能不完整，请人工核对后再采用。\n\n' + str(result.overall_comment);
+  }
   result.raw = raw; // 保留原始返回，便于排查与二期复用
   return result;
 }
@@ -667,8 +978,9 @@ async function gradePaper(config, imageAbsPaths, examContext = {}, onProgress = 
 // 超时 20s（低于前端 axios 的 30s），保证上游慢时前端能收到后端的友好错误而非 axios 超时
 async function testConnection(config) {
   const messages = [{ role: 'user', content: '连接测试，请只回复两个字：正常' }];
-  // 测试用非流式：请求极小、要快速拿到完整回复，且连通性与是否流式无关
-  const raw = await callChatCompletion(config, messages, { timeoutMs: 20000, stream: false });
+  // 测试用非流式：请求极小、要快速拿到完整回复，且连通性与是否流式无关。
+  // 关闭放宽重试：连接测试要在 20s 内给出结果，重试会让耗时翻倍并可能超过前端 axios 的 30s。
+  const raw = await callChatCompletion(config, messages, { timeoutMs: 20000, stream: false, allowRelax: false });
   return { ok: true, reply: str(raw).slice(0, 100) };
 }
 
@@ -687,6 +999,8 @@ module.exports = {
   salvageGradingResult,
   buildResultFromObject,
   parseGradingResult,
+  normalizeQuestion,
+  normalizeResult,
   gradePaper,
   testConnection
 };

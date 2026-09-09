@@ -176,5 +176,6 @@ export const createAiTask = (formData) =>
   request.post('/ai-grading/tasks', formData, { headers: { 'Content-Type': 'multipart/form-data' } })
 export const getAiTask = (id) => request.get(`/ai-grading/tasks/${id}`)
 export const adoptAiTask = (id, data) => request.post(`/ai-grading/tasks/${id}/adopt`, data)
+export const editAiTaskResult = (id, data) => request.put(`/ai-grading/tasks/${id}/result`, data)
 export const deleteAiTask = (id) => request.delete(`/ai-grading/tasks/${id}`)
 export const exportAiTask = (id) => request.get(`/ai-grading/tasks/${id}/export`, { responseType: 'blob' })

@@ -5,7 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const xlsx = require('xlsx');
 const { getDb, getMainDb, runWithClass, getClassContext } = require('../db');
-const { PROVIDER_PRESETS, DEFAULT_SYSTEM_PROMPT, gradePaper, testConnection } = require('../services/aiModel');
+const { PROVIDER_PRESETS, DEFAULT_SYSTEM_PROMPT, gradePaper, testConnection, normalizeQuestion, normalizeResult } = require('../services/aiModel');
 
 // AI 批改新上传图片：ai- 前缀标识为本功能独有，删除任务时可安全清理，
 // 不会误删从考试记录复用的原图（沿用现有 uploads/ 磁盘存储风格）
@@ -20,8 +20,21 @@ const storage = multer.diskStorage({
     cb(null, 'ai-' + uniqueSuffix + '-' + file.originalname);
   }
 });
+// 图片格式白名单：iPhone 默认拍出的是 HEIC，这类文件模型端无法识别、浏览器也预览不了，
+// 在上传阶段就拦下并给出明确提示，避免任务跑了好几分钟才失败
+const ALLOWED_IMAGE_EXT = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp'];
+const imageFileFilter = (req, file, cb) => {
+  const ext = path.extname(file.originalname || '').toLowerCase();
+  if (!ALLOWED_IMAGE_EXT.includes(ext)) {
+    const err = new Error(`不支持的图片格式（${ext || '未知'}）：请转换为 JPG / PNG 后重试。iPhone 拍摄的 HEIC 请在「设置-相机-格式」中改为「兼容性最佳」，或先另存为 JPG`);
+    err.code = 'UNSUPPORTED_IMAGE_TYPE';
+    return cb(err);
+  }
+  cb(null, true);
+};
+
 // 限制单文件 10MB、最多 6 张：AI 以 base64 内联传图，超大图片会使请求体与内存暴涨甚至 OOM
-const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024, files: 6 } });
+const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024, files: 6 }, fileFilter: imageFileFilter });
 
 // 包装上传中间件：把 multer 的英文错误码转成对用户友好的中文提示
 const uploadImages = (req, res, next) => {
@@ -29,10 +42,24 @@ const uploadImages = (req, res, next) => {
     if (!err) return next();
     const msg = err.code === 'LIMIT_FILE_SIZE' ? '单张试卷图片不能超过 10MB，请压缩后重试'
       : err.code === 'LIMIT_FILE_COUNT' ? '单次最多上传 6 张试卷图片'
-      : '图片上传失败：' + err.message;
+      : err.code === 'UNSUPPORTED_IMAGE_TYPE' ? err.message
+        : '图片上传失败：' + err.message;
     return sendResponse(res, null, msg, 400);
   });
 };
+
+// 清理本次上传的图片文件——仅处理 ai- 前缀，且要求 basename 与原值一致、不含 ..，
+// 防止 image_path 被构造成穿越到 uploads/ 之外造成误删（与删除任务的校验口径一致）
+function cleanupUploaded(files) {
+  (files || []).forEach((f) => {
+    const name = f && f.filename;
+    if (!name) return;
+    const base = path.basename(name);
+    if (base !== name || !base.startsWith('ai-') || name.includes('..')) return;
+    const fp = path.join(__dirname, '..', 'uploads', base);
+    if (fs.existsSync(fp)) { try { fs.unlinkSync(fp); } catch (e) { /* 忽略 */ } }
+  });
+}
 
 // 标准响应（与 teacher.js / advisor.js 保持一致）
 const sendResponse = (res, data = {}, message = 'success', code = 200) => {
@@ -48,6 +75,36 @@ function contentDisposition(filename) {
 
 function resultLabel(r) {
   return { correct: '正确', wrong: '错误', partial: '部分正确', blank: '未作答', unknown: '待判定' }[r] || '待判定';
+}
+
+// 手工修正的逐题归一化：与模型输出的 normalizeQuestion 不同，这里老师是最终权威——
+// 只做「字段映射 + 分数收敛到 [0,满分] + 判定枚举归一」，不对「判定 vs 分值」做自动纠正，
+// 老师明确给出的判定原样保留；仅当判定缺省(unknown)时才按分值推导，避免覆盖人工选择。
+function normalizeEditedQuestion(q, i) {
+  if (!q || typeof q !== 'object') return null;
+  let score = Number(q.score ?? q['得分'] ?? 0);
+  const full = Number(q.full_score ?? q.max_score ?? q.fullscore ?? q['满分'] ?? 0);
+  if (!Number.isFinite(score)) score = 0;
+  if (full > 0) score = Math.min(Math.max(score, 0), full);
+  else if (score < 0) score = 0;
+  score = Math.round(score * 100) / 100;
+  let result = normalizeResult(q.result ?? q.status ?? q['结果']);
+  if (result === 'unknown') {
+    if (full > 0) {
+      result = score >= full ? 'correct' : (score <= 0 ? (String(q.student_answer ?? '').trim() ? 'wrong' : 'blank') : 'partial');
+    } else {
+      result = score > 0 ? 'partial' : (String(q.student_answer ?? '').trim() ? 'wrong' : 'blank');
+    }
+  }
+  return {
+    no: String(q.no ?? q.number ?? q.index ?? q['题号'] ?? i + 1),
+    question: String(q.question ?? q.title ?? q['题目'] ?? ''),
+    student_answer: String(q.student_answer ?? q.answer ?? q['学生答案'] ?? q['作答'] ?? ''),
+    score,
+    full_score: full > 0 ? Math.round(full * 100) / 100 : 0,
+    result,
+    comment: String(q.comment ?? q.feedback ?? q['点评'] ?? q['评语'] ?? '')
+  };
 }
 
 // ============ AI 配置（存主库 settings，跨班级共享；apiKey 不下发明文） ============
@@ -94,11 +151,16 @@ function normalizeProvider(raw, apiKeyOverride) {
     max_tokens: (p.max_tokens !== undefined && p.max_tokens !== null && p.max_tokens !== '' && Number(p.max_tokens) > 0) ? Number(p.max_tokens) : 0,
     // 流式响应：默认开启（实时进度 + 空闲超时守护，慢速推理模型长卷也不会被误判超时）
     stream: p.stream !== undefined ? !!p.stream : true,
-    // 思考模式：default=跟随模型（不干预）；suppress=抑制思考（best-effort 关闭 + 思考失控保护）。
+    // 思考模式：default=跟随模型（不干预思考长度，仅受总时长兜底）；
+    //           limited=允许思考但限长（超过 thinking_limit 字仍未作答即中止，中止前先从思考里打捞答案）；
+    //           suppress=尽力关闭思考（下发 enable_thinking=false 等开关）+ 同样限长。
     // 缺省 default，保证既有供应商行为不变。
-    thinking_mode: (p.thinking_mode === 'suppress') ? 'suppress' : 'default',
-    // 思考上限（字符）：仅 suppress 模式生效——思考超过此字数仍未作答即中止，防止失控空转。
-    reasoning_limit: (p.reasoning_limit !== undefined && p.reasoning_limit !== null && p.reasoning_limit !== '' && Number(p.reasoning_limit) > 0) ? Number(p.reasoning_limit) : 15000,
+    thinking_mode: (p.thinking_mode === 'suppress' || p.thinking_mode === 'limited') ? p.thinking_mode : 'default',
+    // 思考上限（字符）：仅 limited / suppress 模式生效——思考超过此字数仍未作答即中止，防止失控空转。
+    // 填 0 表示不限制思考长度（只受「流式总时长上限」兜底）。
+    reasoning_limit: (p.reasoning_limit !== undefined && p.reasoning_limit !== null && p.reasoning_limit !== '')
+      ? Math.max(0, Number(p.reasoning_limit) || 0)
+      : 15000,
     system_prompt: p.system_prompt !== undefined ? String(p.system_prompt) : ''
   };
 }
@@ -141,7 +203,8 @@ async function loadActiveConfig() {
       multimodal: true, temperature: 0.1,
       max_tokens: Number(process.env.AI_MAX_TOKENS) || 0, // 0=不限制输出长度
       stream: process.env.AI_STREAM !== '0', // 默认开启流式
-      thinking_mode: process.env.AI_THINKING_MODE === 'suppress' ? 'suppress' : 'default',
+      thinking_mode: (process.env.AI_THINKING_MODE === 'suppress' || process.env.AI_THINKING_MODE === 'limited')
+        ? process.env.AI_THINKING_MODE : 'default',
       reasoning_limit: Number(process.env.AI_REASONING_LIMIT) || 15000,
       system_prompt: ''
     };
@@ -162,8 +225,8 @@ router.get('/ai-grading/config', async (req, res) => {
       id: p.id, name: p.name, provider: p.provider, base_url: p.base_url, model: p.model,
       multimodal: p.multimodal, temperature: p.temperature, max_tokens: p.max_tokens,
       stream: p.stream !== false, // 缺省视为开启，与 normalizeProvider 默认一致
-      thinking_mode: p.thinking_mode === 'suppress' ? 'suppress' : 'default', // 缺省 default
-      reasoning_limit: (p.reasoning_limit !== undefined && p.reasoning_limit !== null && Number(p.reasoning_limit) > 0) ? Number(p.reasoning_limit) : 15000,
+      thinking_mode: (p.thinking_mode === 'suppress' || p.thinking_mode === 'limited') ? p.thinking_mode : 'default', // 缺省 default
+      reasoning_limit: (p.reasoning_limit !== undefined && p.reasoning_limit !== null) ? Number(p.reasoning_limit) || 0 : 15000,
       system_prompt: p.system_prompt, api_key_set: !!p.api_key, api_key_masked: maskKey(p.api_key)
     }));
     const active = resolveActive(providers, activeId);
@@ -291,6 +354,40 @@ router.post('/ai-grading/test', async (req, res) => {
 // 与本 Map 在同一进程，可直接读取，从而展示「模型思考中…已生成 N 字」的流式进度。
 const taskProgress = new Map();
 
+// 批改任务并发上限：单进程部署下，多任务同时调用本地模型会互相争抢显存与内存，
+// 且每个任务都会把最多 6 张图片一次性读进内存，并发过高极易拖垮整个服务（影响的不只是批改）。
+// 默认串行执行，可用环境变量 AI_GRADING_CONCURRENCY 调大。
+const MAX_CONCURRENT = Math.max(1, Number(process.env.AI_GRADING_CONCURRENCY) || 1);
+let runningCount = 0;
+const waitingQueue = [];
+
+function acquireSlot() {
+  if (runningCount < MAX_CONCURRENT) {
+    runningCount += 1;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => waitingQueue.push(resolve));
+}
+
+function releaseSlot() {
+  runningCount -= 1;
+  if (waitingQueue.length) {
+    runningCount += 1;
+    const next = waitingQueue.shift();
+    next();
+  }
+}
+
+// 入队执行：占到一个并发名额后再跑，跑完（无论成功失败）必定释放，避免名额泄漏
+async function enqueueGrading(taskId, ctx, config, imageFiles, examContext) {
+  await acquireSlot();
+  try {
+    await runGradingAsync(taskId, ctx, config, imageFiles, examContext);
+  } finally {
+    releaseSlot();
+  }
+}
+
 // 后台异步执行批改：脱离请求上下文，用 runWithClass 透传班级库
 async function runGradingAsync(taskId, ctx, config, imageFiles, examContext) {
   if (!ctx) {
@@ -343,7 +440,18 @@ function examContentToText(content) {
   try {
     const parsed = JSON.parse(content);
     if (Array.isArray(parsed)) {
-      return parsed.map((q, i) => `${i + 1}. ${q.question || q.title || JSON.stringify(q)}`).join('\n');
+      // 结构化题目时把分值/参考答案一并带上：模型知道每题满分就不用靠猜，判分更准
+      return parsed.map((q, i) => {
+        const title = (q && typeof q === 'object')
+          ? (q.question || q.title || JSON.stringify(q))
+          : String(q);
+        const extras = [];
+        if (q && typeof q === 'object') {
+          if (q.full_score !== undefined && q.full_score !== null && q.full_score !== '') extras.push(`满分 ${q.full_score}`);
+          if (q.answer !== undefined && q.answer !== null && q.answer !== '') extras.push(`参考答案 ${q.answer}`);
+        }
+        return extras.length ? `${i + 1}. ${title}（${extras.join('，')}）` : `${i + 1}. ${title}`;
+      }).join('\n');
     }
     return typeof parsed === 'string' ? parsed : JSON.stringify(parsed);
   } catch (e) {
@@ -398,6 +506,17 @@ router.post('/ai-grading/tasks', uploadImages, async (req, res) => {
     const student = await db.get('SELECT id, name FROM students WHERE id = ?', [student_id]);
     if (!student) return sendResponse(res, null, '学生不存在', 404);
 
+    // 重复提交保护：同一学生同一试卷已有在跑的任务时直接复用。
+    // 老师连点两次就会发起两次完整调用（本地模型一次要几分钟），既浪费也更容易把服务压垮。
+    const dup = await db.get(
+      "SELECT id, status FROM ai_grading_tasks WHERE exam_id = ? AND student_id = ? AND status IN ('pending','processing') ORDER BY id DESC LIMIT 1",
+      [exam_id, student_id]
+    );
+    if (dup) {
+      cleanupUploaded(req.files);
+      return sendResponse(res, { id: dup.id, status: dup.status, reused: true }, '该学生的这份试卷正在批改中，已为你打开已有任务');
+    }
+
     // 图片来源：优先本次上传；否则复用该生该考试记录里已有的试卷照片
     let imageFiles = [];
     if (req.files && req.files.length) {
@@ -418,8 +537,8 @@ router.post('/ai-grading/tasks', uploadImages, async (req, res) => {
 
     const ctx = getClassContext();
     const examContext = { title: exam.title, subject: exam.subject, content: examContentToText(exam.content) };
-    // 后台执行，不阻塞响应（LLM 调用耗时长，前端改为轮询任务状态）
-    runGradingAsync(taskId, ctx, config, imageFiles, examContext);
+    // 后台执行，不阻塞响应（LLM 调用耗时长，前端改为轮询任务状态）；经队列限流后启动
+    enqueueGrading(taskId, ctx, config, imageFiles, examContext);
 
     sendResponse(res, { id: taskId, status: 'pending' });
   } catch (err) {
@@ -454,6 +573,56 @@ router.get('/ai-grading/tasks/:id', async (req, res) => {
   }
 });
 
+// PUT /ai-grading/tasks/:id/result - 手工修正批改结果：老师可逐题改分数/判定/点评、
+// 增删题目、改总分与总评。保存后即成为该任务的最终结果，后续采纳/导出均以修正后数据为准。
+// 已采纳过的任务仍可再改，改完再点「采纳」即按 UPSERT 覆盖考试记录，无需额外接口。
+router.put('/ai-grading/tasks/:id/result', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const db = await getDb();
+    const task = await db.get('SELECT * FROM ai_grading_tasks WHERE id = ?', [id]);
+    if (!task) return sendResponse(res, null, '任务不存在', 404);
+    if (task.status !== 'success') return sendResponse(res, null, '该任务尚未批改成功，无法编辑', 400);
+
+    const body = req.body || {};
+    if (!Array.isArray(body.questions)) return sendResponse(res, null, '缺少题目明细（questions）', 400);
+    const questions = body.questions.map(normalizeEditedQuestion).filter(Boolean);
+    if (!questions.length) return sendResponse(res, null, '题目明细为空', 400);
+
+    // 总分/满分：老师显式给出则以其为准，否则按逐题合计兜底；满分无逐题信息时沿用原任务值
+    const sumScore = Math.round(questions.reduce((s, q) => s + q.score, 0) * 100) / 100;
+    const sumFull = Math.round(questions.reduce((s, q) => s + q.full_score, 0) * 100) / 100;
+    const hasTotal = body.total_score !== undefined && body.total_score !== null && body.total_score !== '';
+    const hasFull = body.full_score !== undefined && body.full_score !== null && body.full_score !== '';
+    const totalScore = hasTotal ? Number(body.total_score) : sumScore;
+    const fullScore = hasFull ? Number(body.full_score) : (sumFull || task.full_score || 100);
+    if (!Number.isFinite(totalScore) || totalScore < 0) return sendResponse(res, null, '总分非法，请输入 0 或正数', 400);
+    if (!Number.isFinite(fullScore) || fullScore < 0) return sendResponse(res, null, '满分非法，请输入 0 或正数', 400);
+
+    const overall = body.overall_comment !== undefined && body.overall_comment !== null
+      ? String(body.overall_comment)
+      : (task.comment || '');
+
+    const detail = {
+      full_score: Math.round(fullScore * 100) / 100,
+      total_score: Math.round(totalScore * 100) / 100,
+      overall_comment: overall,
+      questions,
+      manual_edited: true,
+      manual_edited_at: new Date().toISOString()
+    };
+
+    await db.run(
+      'UPDATE ai_grading_tasks SET total_score = ?, full_score = ?, comment = ?, detail = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      [detail.total_score, detail.full_score, overall, JSON.stringify(detail), id]
+    );
+
+    sendResponse(res, detail, '已保存修改');
+  } catch (err) {
+    sendResponse(res, null, err.message, 500);
+  }
+});
+
 // POST /ai-grading/tasks/:id/adopt - 采纳成绩：写回考试记录并同步成绩分析
 router.post('/ai-grading/tasks/:id/adopt', async (req, res) => {
   try {
@@ -475,15 +644,31 @@ router.post('/ai-grading/tasks/:id/adopt', async (req, res) => {
     }
     const comment = req.body.comment !== undefined ? req.body.comment : (task.comment || '');
 
+    // 逐题明细一并留存到考试记录：AI 批改任务属过程数据、可能被清理，
+    // 而考试记录是长期档案。存下来后，即便任务被删除仍可回看与导出。
+    // 注意：若本次没有明细（例如手工补录成绩），不去覆盖已有明细，避免误清历史数据。
+    let detailJson = null;
+    if (task.detail) {
+      try {
+        const d = JSON.parse(task.detail);
+        const qs = d && Array.isArray(d.questions) ? d.questions : [];
+        if (qs.length) detailJson = JSON.stringify({ ...d, questions: qs });
+      } catch (e) { /* 明细异常不影响采纳主流程 */ }
+    }
+
     // 写入/更新考试记录
     let rec = await db.get('SELECT id FROM exam_records WHERE exam_id = ? AND student_id = ?', [task.exam_id, task.student_id]);
     let recId;
     if (rec) {
       recId = rec.id;
-      await db.run('UPDATE exam_records SET score = ?, comment = ? WHERE id = ?', [score, comment, recId]);
+      if (detailJson) {
+        await db.run('UPDATE exam_records SET score = ?, comment = ?, detail = ? WHERE id = ?', [score, comment, detailJson, recId]);
+      } else {
+        await db.run('UPDATE exam_records SET score = ?, comment = ? WHERE id = ?', [score, comment, recId]);
+      }
     } else {
-      const r = await db.run('INSERT INTO exam_records (exam_id, student_id, score, comment) VALUES (?, ?, ?, ?)',
-        [task.exam_id, task.student_id, score, comment]);
+      const r = await db.run('INSERT INTO exam_records (exam_id, student_id, score, comment, detail) VALUES (?, ?, ?, ?, ?)',
+        [task.exam_id, task.student_id, score, comment, detailJson]);
       recId = r.lastID;
     }
 

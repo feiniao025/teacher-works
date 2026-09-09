@@ -439,9 +439,9 @@ router.get('/exam-records/export', async (req, res) => {
     const exam = await db.get('SELECT title FROM exams WHERE id = ?', [exam_id]);
     if (!exam) return sendResponse(res, null, '考试不存在', 404);
     
-    // 获取考试记录
+    // 获取考试记录（detail 为 AI 批改采纳时留存的逐题明细 JSON，用于追加「逐题明细」表）
     const records = await db.all(`
-      SELECT er.score, er.comment, er.remark, s.id as student_id, s.name as student_name
+      SELECT er.score, er.comment, er.remark, er.detail, s.id as student_id, s.name as student_name
       FROM exam_records er
       LEFT JOIN students s ON er.student_id = s.id
       WHERE er.exam_id = ?
@@ -471,6 +471,45 @@ router.get('/exam-records/export', async (req, res) => {
     ];
     
     xlsx.utils.book_append_sheet(wb, ws, '成绩数据');
+
+    // 逐题明细：凡采纳过 AI 批改、考试记录里留存了 detail 的学生，逐题展开到第二个工作表，
+    // 满足「过去很长时间后仍能导出查看、留存」的需求。无明细时不生成该表，行为与升级前一致。
+    const RESULT_LABEL = { correct: '正确', wrong: '错误', partial: '部分正确', blank: '未作答', unknown: '待判定' };
+    const detailRows = [];
+    for (const r of records) {
+      if (!r.detail) continue;
+      let d = null;
+      try { d = JSON.parse(r.detail); } catch (e) { d = null; }
+      const qs = d && Array.isArray(d.questions) ? d.questions : [];
+      for (const q of qs) {
+        detailRows.push({
+          '学号': r.student_id,
+          '姓名': r.student_name,
+          '题号': q.no,
+          '题目': q.question,
+          '学生作答': q.student_answer,
+          '得分': q.score,
+          '满分': q.full_score,
+          '判定': RESULT_LABEL[q.result] || '待判定',
+          '点评': q.comment || ''
+        });
+      }
+    }
+    if (detailRows.length) {
+      const ws2 = xlsx.utils.json_to_sheet(detailRows);
+      ws2['!cols'] = [
+        { wch: 10 }, // 学号
+        { wch: 15 }, // 姓名
+        { wch: 8 },  // 题号
+        { wch: 30 }, // 题目
+        { wch: 30 }, // 学生作答
+        { wch: 8 },  // 得分
+        { wch: 8 },  // 满分
+        { wch: 10 }, // 判定
+        { wch: 40 }  // 点评
+      ];
+      xlsx.utils.book_append_sheet(wb, ws2, '逐题明细');
+    }
 
     // 设置响应头并写入响应（buffer 方式，writeFile 不支持响应流）
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');

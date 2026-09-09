@@ -240,8 +240,9 @@
             <span v-else class="text-muted">无</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="160" fixed="right">
+        <el-table-column label="操作" width="200" fixed="right">
           <template #default="scope">
+            <el-button v-if="hasRecordDetail(scope.row)" link type="primary" size="small" @click="showRecordDetail(scope.row)">明细</el-button>
             <el-button link type="primary" size="small" @click="editRecord(scope.row)">编辑</el-button>
             <el-popconfirm title="删除该学生的考试记录？" @confirm="removeRecord(scope.row)">
               <template #reference>
@@ -251,6 +252,33 @@
           </template>
         </el-table-column>
       </el-table>
+    </el-dialog>
+
+    <!-- 批改明细对话框（只读）：查看 AI 批改采纳时留存的逐题数据 -->
+    <el-dialog v-model="detailRecordVisible" :title="`批改明细 · ${detailRecordStudent}`" width="680px" top="8vh">
+      <div class="record-detail-body">
+        <el-alert
+          v-if="detailRecordMeta"
+          type="info" :closable="false" show-icon style="margin-bottom: 12px"
+          :title="detailRecordMeta"
+        />
+        <el-empty v-if="!recordDetailQuestions.length" description="该记录暂无逐题明细" :image-size="60" />
+        <div v-else class="record-q-list">
+          <div v-for="(q, i) in recordDetailQuestions" :key="i" class="record-q-item" :class="'record-q-' + (q.result || 'unknown')">
+            <div class="record-q-head">
+              <span class="record-q-no">第 {{ q.no }} 题</span>
+              <el-tag :type="detailResultTag(q.result).type" size="small">{{ detailResultTag(q.result).label }}</el-tag>
+              <span class="record-q-score">{{ q.score }} / {{ q.full_score }}</span>
+            </div>
+            <div class="record-q-row" v-if="q.question"><span class="record-q-label">题目</span>{{ q.question }}</div>
+            <div class="record-q-row" v-if="q.student_answer"><span class="record-q-label">作答</span>{{ q.student_answer }}</div>
+            <div class="record-q-row record-q-comment" v-if="q.comment"><span class="record-q-label">点评</span>{{ q.comment }}</div>
+          </div>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="detailRecordVisible = false">关闭</el-button>
+      </template>
     </el-dialog>
 
     <!-- 添加学生到考试记录对话框 -->
@@ -413,6 +441,36 @@ const newRecordImageFiles = ref([])
 const getRecordImages = (row) => {
   if (!row || !row.image_path) return []
   return row.image_path.split(',').filter(Boolean)
+}
+
+// 批改明细（只读）：查看 AI 批改采纳时留存的逐题数据，长期可回看
+const detailRecordVisible = ref(false)
+const detailRecordStudent = ref('')
+const detailRecordMeta = ref('')
+const recordDetailQuestions = ref([])
+const detailResultTag = (r) => ({
+  correct: { type: 'success', label: '正确' },
+  wrong: { type: 'danger', label: '错误' },
+  partial: { type: 'warning', label: '部分正确' },
+  blank: { type: 'info', label: '未作答' },
+  unknown: { type: 'info', label: '待判定' }
+}[r] || { type: 'info', label: '待判定' })
+const hasRecordDetail = (row) => {
+  if (!row || !row.detail) return false
+  try {
+    const d = typeof row.detail === 'string' ? JSON.parse(row.detail) : row.detail
+    return !!(d && Array.isArray(d.questions) && d.questions.length)
+  } catch (e) { return false }
+}
+const showRecordDetail = (row) => {
+  let d = null
+  try { d = typeof row.detail === 'string' ? JSON.parse(row.detail) : row.detail } catch (e) { d = null }
+  detailRecordStudent.value = row.student_name || ''
+  detailRecordMeta.value = d
+    ? `AI 判分 ${d.total_score ?? ''} / ${d.full_score ?? ''}${d.overall_comment ? '　' + d.overall_comment : ''}`
+    : ''
+  recordDetailQuestions.value = d && Array.isArray(d.questions) ? d.questions : []
+  detailRecordVisible.value = true
 }
 
 // 新图片选择
@@ -895,4 +953,31 @@ onMounted(() => {
   flex-wrap: wrap;
   margin-bottom: 8px;
 }
+/* 批改明细（只读） */
+.record-detail-body {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.record-q-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.record-q-item {
+  border: 1px solid #ebeef5;
+  border-left: 3px solid #dcdfe6;
+  border-radius: 6px;
+  padding: 8px 12px;
+  background: #fff;
+}
+.record-q-correct { border-left-color: #67c23a; }
+.record-q-wrong { border-left-color: #f56c6c; }
+.record-q-partial { border-left-color: #e6a23c; }
+.record-q-blank { border-left-color: #909399; }
+.record-q-head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+.record-q-no { font-weight: 600; color: #303133; }
+.record-q-score { margin-left: auto; font-weight: 600; color: #409eff; }
+.record-q-row { font-size: 13px; color: #606266; line-height: 1.7; word-break: break-word; }
+.record-q-label { display: inline-block; min-width: 34px; color: #909399; margin-right: 6px; }
+.record-q-comment { color: #e6a23c; }
 </style>

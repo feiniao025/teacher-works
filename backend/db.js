@@ -74,6 +74,22 @@ async function ensureAiGradingSchema(db) {
   );
 }
 
+// 幂等补齐 exam_records 的 AI 批改明细列（detail TEXT，存逐题明细 JSON）。
+// 用途：AI 批改任务属过程数据、可能被清理，而考试记录是长期留存的档案。
+// 采纳时把逐题数据一并写入，之后即便删除批改任务，仍可在考试记录中回看与导出。
+// 先用 PRAGMA 判断列是否存在，避免对已升级的库重复 ALTER 报错。
+async function ensureExamRecordDetailColumn(db) {
+  try {
+    const cols = await db.all('PRAGMA table_info(exam_records)');
+    if (Array.isArray(cols) && cols.length && !cols.some(c => c.name === 'detail')) {
+      await db.run('ALTER TABLE exam_records ADD COLUMN detail TEXT');
+    }
+  } catch (e) {
+    // 补列失败不应阻断启动：明细只是留存增强，主流程（成绩读写）不受影响
+    console.warn('[db] exam_records.detail 补列失败，AI 明细留存功能不可用：', e && e.message);
+  }
+}
+
 // 获取当前请求上下文的班级库连接：
 // 1. 无班级上下文（启动阶段/健康检查等）或默认班级 -> 主库
 // 2. 有上下文 -> 对应班级库文件（按文件路径缓存连接）
@@ -89,8 +105,9 @@ async function getDb() {
     filename: path.join(classDbDir, ctx.dbFile),
     driver: sqlite3.Database
   });
-  // 既有班级库首次打开：补齐本次升级新增的表并复位遗留 AI 任务（幂等，仅进程内首次）
+  // 既有班级库首次打开：补齐本次升级新增的表/列并复位遗留 AI 任务（幂等，仅进程内首次）
   await ensureAiGradingSchema(conn);
+  await ensureExamRecordDetailColumn(conn);
   classDbCache.set(ctx.dbFile, conn);
   return conn;
 }
@@ -502,6 +519,7 @@ async function initClassDb(db) {
   // AI 批改任务表统一由 ensureAiGradingSchema 建表并复位遗留任务
   // （主库/新建班级走此处；升级前已存在的班级库在 getDb 首次打开时补建）
   await ensureAiGradingSchema(db);
+  await ensureExamRecordDetailColumn(db);
 
   console.log('Database initialized and tables created/verified.');
 }

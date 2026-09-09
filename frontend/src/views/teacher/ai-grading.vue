@@ -57,7 +57,7 @@
         ref="uploadRef"
         :auto-upload="false"
         :limit="6"
-        accept="image/*"
+        accept="image/jpeg,image/png,image/webp,image/bmp,image/gif"
         multiple
         list-type="picture-card"
         :on-change="onImageChange"
@@ -67,6 +67,7 @@
       </el-upload>
       <div class="form-tip">
         上传该学生的试卷照片（可多张，越清晰越准）。若不上传，将自动使用其在「试卷管理 → 考试记录」中已有的试卷照片。
+        支持 JPG / PNG / WEBP；iPhone 的 HEIC 请先在相册中另存为 JPG。过大的照片会在上传前自动压缩，以缩短等待时间。
       </div>
       <div style="margin-top: 14px">
         <el-button type="primary" :loading="starting" :disabled="!aiEnabled" @click="startGrading">
@@ -137,7 +138,7 @@
     </el-card>
 
     <!-- 批改详情对话框 -->
-    <el-dialog v-model="detailVisible" title="批改详情" width="960px" top="6vh" @closed="stopDetailPolling">
+    <el-dialog v-model="detailVisible" title="批改详情" width="960px" top="6vh" @closed="onDetailClosed">
       <div v-if="currentTask" class="detail-wrap">
         <div class="detail-head">
           <div class="detail-head-item">
@@ -172,52 +173,127 @@
 
         <template v-if="currentTask.status === 'success'">
           <el-alert
-            v-if="currentTask.comment"
+            v-if="currentTask.comment && !editing"
             type="success" :closable="false" show-icon
             :title="'总评：' + currentTask.comment" style="margin-bottom: 12px"
           />
           <div class="detail-body">
+            <!-- 左栏：原图常驻。右栏题目列表独立滚动，左边图片始终可见，便于对照核对 -->
             <div class="detail-left">
-              <div class="section-title">试卷原图</div>
-              <div class="img-list">
+              <div class="section-title">试卷原图（{{ taskImages(currentTask).length }} 张）</div>
+              <div class="img-stage">
                 <el-image
-                  v-for="(img, i) in taskImages(currentTask)" :key="img"
-                  class="detail-img"
-                  :src="`/uploads/${img}`"
-                  :preview-src-list="taskImages(currentTask).map(x => `/uploads/${x}`)"
-                  :initial-index="i"
+                  v-if="currentImageSrc"
+                  class="stage-img"
+                  :src="currentImageSrc"
+                  :preview-src-list="imageSrcList"
+                  :initial-index="activeImgIndex"
                   fit="contain"
                   preview-teleported
                 />
+                <el-empty v-else description="无原图" :image-size="60" />
+              </div>
+              <div v-if="taskImages(currentTask).length > 1" class="img-thumbs">
+                <div
+                  v-for="(img, i) in taskImages(currentTask)"
+                  :key="img"
+                  class="thumb"
+                  :class="{ active: i === activeImgIndex }"
+                  @click="activeImgIndex = i"
+                >
+                  <img :src="`/uploads/${img}`" />
+                </div>
               </div>
             </div>
+
+            <!-- 右栏：逐题批改（只读 / 编辑两种形态） -->
             <div class="detail-right">
-              <div class="section-title">逐题批改（{{ detailQuestions.length }} 题）</div>
-              <div class="q-list">
-                <div v-for="(q, i) in detailQuestions" :key="i" class="q-item" :class="'q-' + q.result">
-                  <div class="q-head">
-                    <span class="q-no">第 {{ q.no }} 题</span>
-                    <el-tag :type="resultTag(q.result).type" size="small">{{ resultTag(q.result).label }}</el-tag>
-                    <span class="q-score">{{ q.score }} / {{ q.full_score }}</span>
+              <template v-if="!editing">
+                <div class="section-title">逐题批改（{{ detailQuestions.length }} 题）</div>
+                <div class="q-list">
+                  <div v-for="(q, i) in detailQuestions" :key="i" class="q-item" :class="'q-' + q.result">
+                    <div class="q-head">
+                      <span class="q-no">第 {{ q.no }} 题</span>
+                      <el-tag :type="resultTag(q.result).type" size="small">{{ resultTag(q.result).label }}</el-tag>
+                      <span class="q-score">{{ q.score }} / {{ q.full_score }}</span>
+                    </div>
+                    <div class="q-row" v-if="q.question"><span class="q-label">题目</span>{{ q.question }}</div>
+                    <div class="q-row" v-if="q.student_answer"><span class="q-label">作答</span>{{ q.student_answer }}</div>
+                    <div class="q-row q-comment" v-if="q.comment"><span class="q-label">点评</span>{{ q.comment }}</div>
                   </div>
-                  <div class="q-row" v-if="q.question"><span class="q-label">题目</span>{{ q.question }}</div>
-                  <div class="q-row" v-if="q.student_answer"><span class="q-label">作答</span>{{ q.student_answer }}</div>
-                  <div class="q-row q-comment" v-if="q.comment"><span class="q-label">点评</span>{{ q.comment }}</div>
+                  <el-empty v-if="!detailQuestions.length" description="模型未返回逐题明细" :image-size="60" />
                 </div>
-                <el-empty v-if="!detailQuestions.length" description="模型未返回逐题明细" :image-size="60" />
-              </div>
+              </template>
+
+              <template v-else>
+                <div class="section-title">逐题批改 · 编辑中（{{ editForm.questions.length }} 题）</div>
+                <div class="edit-summary">
+                  <div class="edit-sum-row">
+                    <span class="edit-label">满分</span>
+                    <el-input-number v-model="editForm.full_score" :min="0" :max="999" :precision="1" size="small" style="width: 110px" />
+                    <span class="edit-label">总分</span>
+                    <el-input-number v-model="editForm.total_score" :min="0" :max="999" :precision="1" size="small" style="width: 110px" />
+                    <span class="form-tip">
+                      逐题合计：<b class="edit-sum">{{ editSum }}</b>
+                      <el-button link type="primary" size="small" @click="editForm.total_score = editSum">用合计</el-button>
+                    </span>
+                  </div>
+                  <div class="edit-sum-row">
+                    <span class="edit-label">总评</span>
+                    <el-input v-model="editForm.overall_comment" type="textarea" :rows="2" placeholder="总体评价（可留空）" />
+                  </div>
+                </div>
+                <div class="q-list">
+                  <div v-for="(q, i) in editForm.questions" :key="i" class="q-item q-edit">
+                    <div class="q-head">
+                      <el-input v-model="q.no" size="small" style="width: 60px" placeholder="题号" />
+                      <el-select v-model="q.result" size="small" style="width: 110px">
+                        <el-option label="正确" value="correct" />
+                        <el-option label="部分正确" value="partial" />
+                        <el-option label="错误" value="wrong" />
+                        <el-option label="未作答" value="blank" />
+                      </el-select>
+                      <div class="edit-score">
+                        <span class="form-tip">得分</span>
+                        <el-input-number v-model="q.score" :min="0" :max="999" :precision="1" size="small" style="width: 88px" />
+                        <span class="form-tip">满分</span>
+                        <el-input-number v-model="q.full_score" :min="0" :max="999" :precision="1" size="small" style="width: 88px" />
+                      </div>
+                      <el-button link type="danger" size="small" @click="removeEditQuestion(i)">删除</el-button>
+                    </div>
+                    <div class="q-row"><span class="q-label">题目</span><el-input v-model="q.question" type="textarea" :rows="1" size="small" /></div>
+                    <div class="q-row"><span class="q-label">作答</span><el-input v-model="q.student_answer" type="textarea" :rows="1" size="small" /></div>
+                    <div class="q-row"><span class="q-label">点评</span><el-input v-model="q.comment" type="textarea" :rows="1" size="small" /></div>
+                  </div>
+                  <el-empty v-if="!editForm.questions.length" description="暂无题目" :image-size="60" />
+                  <el-button style="margin-top: 8px" size="small" plain @click="addEditQuestion">
+                    <el-icon><Plus /></el-icon>添加题目
+                  </el-button>
+                </div>
+              </template>
             </div>
           </div>
         </template>
       </div>
       <template #footer>
-        <el-button @click="detailVisible = false">关闭</el-button>
-        <el-button v-if="currentTask && currentTask.status === 'success'" type="warning" plain @click="exportDoc(currentTask)">
-          <el-icon><Download /></el-icon>导出批改文档
-        </el-button>
-        <el-button v-if="currentTask && currentTask.status === 'success'" type="success" @click="openAdopt(currentTask)">
-          <el-icon><Select /></el-icon>采纳到成绩
-        </el-button>
+        <el-button @click="closeDetail">关闭</el-button>
+        <template v-if="currentTask && currentTask.status === 'success'">
+          <el-button v-if="!editing" type="primary" plain @click="startEdit">
+            <el-icon><Edit /></el-icon>编辑修改
+          </el-button>
+          <template v-else>
+            <el-button @click="editing = false">取消</el-button>
+            <el-button type="primary" :loading="savingEdit" @click="saveEdit">
+              <el-icon><Check /></el-icon>保存修改
+            </el-button>
+          </template>
+          <el-button v-if="!editing" type="warning" plain @click="exportDoc(currentTask)">
+            <el-icon><Download /></el-icon>导出
+          </el-button>
+          <el-button v-if="!editing" type="success" @click="openAdopt(currentTask)">
+            <el-icon><Select /></el-icon>采纳到成绩
+          </el-button>
+        </template>
       </template>
     </el-dialog>
 
@@ -270,6 +346,18 @@
         </el-table-column>
         <el-table-column prop="name" label="名称" min-width="110" show-overflow-tooltip />
         <el-table-column prop="model" label="模型" min-width="140" show-overflow-tooltip />
+        <el-table-column label="思考" width="96" align="center">
+          <template #default="{ row }">
+            <el-tooltip content="点击可在「编辑」中切换思考模式：跟随模型 / 限制思考 / 关闭思考" placement="top">
+              <el-tag
+                style="cursor: pointer"
+                size="small"
+                :type="row.thinking_mode === 'suppress' ? 'success' : (row.thinking_mode === 'limited' ? 'warning' : 'info')"
+                @click="openEditProvider(row)"
+              >{{ row.thinking_mode === 'suppress' ? '已关闭' : (row.thinking_mode === 'limited' ? '限制' : '跟随') }}</el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
         <el-table-column prop="base_url" label="服务地址" min-width="180" show-overflow-tooltip />
         <el-table-column label="密钥" width="90" align="center">
           <template #default="{ row }">
@@ -353,16 +441,21 @@
           </div>
         </el-form-item>
         <el-form-item label="思考模式">
-          <el-switch v-model="providerForm.thinking_mode" active-value="suppress" inactive-value="default" />
-          <span class="form-tip" style="margin-left: 10px">{{ providerForm.thinking_mode === 'suppress' ? '抑制思考（推荐本地/推理型模型）' : '默认（跟随模型）' }}</span>
-          <div v-if="providerForm.thinking_mode === 'suppress'" style="margin-top: 6px">
-            <span class="form-tip">思考上限（字）：</span>
-            <el-input-number v-model="providerForm.reasoning_limit" :min="1000" :max="100000" :step="1000" size="small" />
+          <el-radio-group v-model="providerForm.thinking_mode" size="small">
+            <el-radio-button value="default">跟随模型</el-radio-button>
+            <el-radio-button value="limited">限制思考</el-radio-button>
+            <el-radio-button value="suppress">关闭思考</el-radio-button>
+          </el-radio-group>
+          <div v-if="providerForm.thinking_mode !== 'default'" style="margin-top: 6px">
+            <span class="form-tip">思考上限（字，0 = 不限制）：</span>
+            <el-input-number v-model="providerForm.reasoning_limit" :min="0" :max="200000" :step="1000" size="small" />
           </div>
           <div class="form-tip">
             {{ providerForm.thinking_mode === 'suppress'
-              ? '对支持的模型（云端 Qwen3 / DeepSeek 等）尽力关闭思考过程；对所有模型启用「思考失控保护」——思考超过上限字数仍未作答即中止，避免推理型模型长时间空转'
-              : '不干预模型的思考过程，仅保留极高的失控兜底。若模型思考冗长、或长时间不作答，建议开启「抑制思考」' }}
+              ? '关闭思考（推荐本地 / 推理型模型）：下发 enable_thinking=false 等开关尽力关闭思考过程，并追加简洁作答指令；本地 9B 模型实测可把单次批改从十几分钟降到几分钟。若模型不支持关闭，仍由「思考上限」兜底'
+              : providerForm.thinking_mode === 'limited'
+                ? '限制思考：允许模型思考，但思考超过上限字数仍未作答即中止（中止前会先尝试从已有思考中提取答案）。适合想保留推理质量、又不希望无限空转的场景'
+                : '跟随模型：完全不干预思考长度——思考过程只是多占一点内存、页面也不展示，不会因此中断批改，仅受「流式总时长上限」兜底。若模型思考冗长导致等待过久，建议改为「关闭思考」' }}
           </div>
         </el-form-item>
         <el-form-item label="系统提示词">
@@ -390,7 +483,7 @@ import { ElMessage } from 'element-plus'
 import {
   getAiPresets, getAiConfig, saveAiConfig, testAiConnection,
   addAiProvider, updateAiProvider, deleteAiProvider, activateAiProvider, testAiProvider,
-  getAiTasks, createAiTask, getAiTask, adoptAiTask, deleteAiTask, exportAiTask,
+  getAiTasks, createAiTask, getAiTask, adoptAiTask, editAiTaskResult, deleteAiTask, exportAiTask,
   getExams, getStudents
 } from '../../api'
 
@@ -424,6 +517,49 @@ const onImageChange = (file, uploadFiles) => {
   imageFiles.value = (uploadFiles || []).map(f => f.raw).filter(Boolean)
 }
 
+// 大图压缩：手机拍的试卷单张常达 5~8MB，转 base64 后还要再膨胀约 1/3，
+// 会明显拉长模型的视觉编码时间（多图时首字节等待可达数分钟）并推高内存占用。
+// 只对「体积或长边超标」的 JPEG/PNG/WEBP 处理——手写小字对分辨率敏感，不能一刀切压小；
+// 任何一步异常或压缩后反而更大，都回退原图，保证图片数量与顺序完全不变。
+const MAX_EDGE = 2048
+const COMPRESS_THRESHOLD = 3 * 1024 * 1024
+const compressImage = (file) => new Promise((resolve) => {
+  const fallback = () => resolve(file)
+  try {
+    if (!file || !/^image\/(jpeg|png|webp)$/.test(file.type)) return fallback()
+    if (!file.size || file.size <= COMPRESS_THRESHOLD) return fallback()
+    const url = URL.createObjectURL(file)
+    const img = new Image()
+    img.onload = () => {
+      try {
+        const w = img.naturalWidth || 0
+        const h = img.naturalHeight || 0
+        if (!w || !h) { URL.revokeObjectURL(url); return fallback() }
+        const scale = Math.min(1, MAX_EDGE / Math.max(w, h))
+        // 尺寸本来就没超，只是体积偏大：不重绘，避免无谓的画质损失
+        if (scale >= 1) { URL.revokeObjectURL(url); return fallback() }
+        const canvas = document.createElement('canvas')
+        canvas.width = Math.round(w * scale)
+        canvas.height = Math.round(h * scale)
+        canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height)
+        canvas.toBlob((blob) => {
+          URL.revokeObjectURL(url)
+          if (!blob || blob.size >= file.size) return fallback()
+          const name = String(file.name || 'image').replace(/\.[^.]+$/, '') + '.jpg'
+          resolve(new File([blob], name, { type: 'image/jpeg' }))
+        }, 'image/jpeg', 0.9)
+      } catch (e) {
+        URL.revokeObjectURL(url)
+        fallback()
+      }
+    }
+    img.onerror = () => { URL.revokeObjectURL(url); fallback() }
+    img.src = url
+  } catch (e) {
+    fallback()
+  }
+})
+
 const startGrading = async () => {
   if (!newForm.value.exam_id) return ElMessage.warning('请选择试卷')
   if (!newForm.value.student_id) return ElMessage.warning('请选择学生')
@@ -432,7 +568,10 @@ const startGrading = async () => {
     const fd = new FormData()
     fd.append('exam_id', newForm.value.exam_id)
     fd.append('student_id', newForm.value.student_id)
-    imageFiles.value.forEach(f => fd.append('images', f))
+    // 上传前压缩超大图；顺序与原数组一致，页序不会乱
+    const files = []
+    for (const f of imageFiles.value) files.push(await compressImage(f))
+    files.forEach(f => fd.append('images', f))
     const r = await createAiTask(fd)
     ElMessage.success('已提交批改，AI 正在处理…')
     uploadRef.value?.clearFiles()
@@ -500,7 +639,71 @@ const detailQuestions = computed(() => {
 })
 const taskImages = (t) => (t && t.image_path ? t.image_path.split(',').filter(Boolean) : [])
 
+// 原图常驻：左栏单图舞台 + 缩略图切换；右栏题目滚动时左边图片始终可见
+const activeImgIndex = ref(0)
+const imageSrcList = computed(() => taskImages(currentTask.value).map(x => `/uploads/${x}`))
+const currentImageSrc = computed(() => imageSrcList.value[activeImgIndex.value] || '')
+
+const closeDetail = () => {
+  detailVisible.value = false
+}
+const onDetailClosed = () => {
+  stopDetailPolling()
+  editing.value = false
+  activeImgIndex.value = 0
+}
+
+// ---------- 手工编辑 ----------
+const editing = ref(false)
+const savingEdit = ref(false)
+const editForm = ref({ total_score: 0, full_score: 0, overall_comment: '', questions: [] })
+const editSum = computed(() => {
+  const s = (editForm.value.questions || []).reduce((sum, q) => sum + (Number(q.score) || 0), 0)
+  return Math.round(s * 100) / 100
+})
+const startEdit = () => {
+  const d = currentTask.value?.detail
+  const qs = d && Array.isArray(d.questions) ? d.questions : []
+  editForm.value = {
+    total_score: Number(currentTask.value?.total_score ?? 0),
+    full_score: Number(currentTask.value?.full_score ?? 0),
+    overall_comment: currentTask.value?.comment || '',
+    questions: qs.map(q => ({ ...q }))
+  }
+  editing.value = true
+}
+const addEditQuestion = () => {
+  editForm.value.questions.push({
+    no: '', question: '', student_answer: '', score: 0, full_score: 0, result: 'unknown', comment: ''
+  })
+}
+const removeEditQuestion = (i) => {
+  editForm.value.questions.splice(i, 1)
+}
+const saveEdit = async () => {
+  if (!currentTask.value) return
+  savingEdit.value = true
+  try {
+    await editAiTaskResult(currentTask.value.id, {
+      total_score: editForm.value.total_score,
+      full_score: editForm.value.full_score,
+      overall_comment: editForm.value.overall_comment,
+      questions: editForm.value.questions
+    })
+    ElMessage.success('已保存修改，可点「采纳到成绩」写入考试记录')
+    editing.value = false
+    await refreshDetail(currentTask.value.id)
+    await loadTasks(true)
+  } catch (e) {
+    // 拦截器已提示
+  } finally {
+    savingEdit.value = false
+  }
+}
+
 const viewDetail = async (row) => {
+  activeImgIndex.value = 0
+  editing.value = false
   detailVisible.value = true
   await refreshDetail(row.id)
   if (currentTask.value && ['pending', 'processing'].includes(currentTask.value.status)) {
@@ -656,8 +859,8 @@ const openAddProvider = () => {
     stream: true,          // 默认开启流式：实时进度 + 避免长等待超时
     limit_tokens: false,   // 默认不限制输出长度（推理型模型不会被截断）
     max_tokens: 8000,      // 仅在开启「限制 Tokens」时生效
-    thinking_mode: 'default',  // 默认跟随模型；本地/推理型模型可改「抑制思考」
-    reasoning_limit: 15000,    // 仅「抑制思考」生效：思考超此字数仍未作答即中止
+    thinking_mode: 'default',  // 默认跟随模型；本地/推理型模型建议改「关闭思考」
+    reasoning_limit: 15000,    // 仅「限制思考 / 关闭思考」生效：思考超此字数仍未作答即中止（0=不限制）
     system_prompt: ''
   }
   providerVisible.value = true
@@ -679,8 +882,8 @@ const openEditProvider = (p) => {
     stream: p.stream !== false,               // 缺省视为开启
     limit_tokens: (p.max_tokens || 0) > 0,    // 有限制值才算「限制」
     max_tokens: (p.max_tokens || 0) > 0 ? p.max_tokens : 8000,
-    thinking_mode: p.thinking_mode === 'suppress' ? 'suppress' : 'default',
-    reasoning_limit: (p.reasoning_limit || 0) > 0 ? p.reasoning_limit : 15000,
+    thinking_mode: (p.thinking_mode === 'suppress' || p.thinking_mode === 'limited') ? p.thinking_mode : 'default',
+    reasoning_limit: p.reasoning_limit !== undefined && p.reasoning_limit !== null ? Number(p.reasoning_limit) || 0 : 15000,
     system_prompt: p.system_prompt || ''
   }
   providerVisible.value = true
@@ -821,18 +1024,23 @@ onBeforeUnmount(() => {
 .score-ok { color: #e6a23c; font-weight: 600; }
 .score-bad { color: #f56c6c; font-weight: 600; }
 
-.detail-wrap { max-height: 66vh; overflow: auto; }
-.detail-head { display: flex; flex-wrap: wrap; gap: 24px; padding-bottom: 12px; border-bottom: 1px solid #f0f0f0; margin-bottom: 12px; }
+.detail-wrap { height: 74vh; display: flex; flex-direction: column; overflow: hidden; }
+.detail-head { display: flex; flex-wrap: wrap; gap: 24px; padding-bottom: 12px; border-bottom: 1px solid #f0f0f0; margin-bottom: 12px; flex-shrink: 0; }
+.detail-wrap > .el-alert { flex-shrink: 0; }
 .detail-head-item { display: flex; flex-direction: column; gap: 4px; }
 .detail-head-item .label { font-size: 12px; color: #909399; }
 .detail-head-item .value { font-size: 14px; color: #303133; }
 .detail-head-item .value.big { font-size: 24px; }
-.detail-body { display: flex; gap: 16px; }
-.detail-left { width: 320px; flex-shrink: 0; }
-.detail-right { flex: 1; min-width: 0; }
+.detail-body { display: flex; gap: 16px; flex: 1; min-height: 0; overflow: hidden; }
+.detail-left { width: 300px; flex-shrink: 0; display: flex; flex-direction: column; min-height: 0; }
+.detail-right { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; padding-right: 6px; }
 .section-title { font-size: 13px; font-weight: 600; color: #606266; margin-bottom: 8px; }
-.img-list { display: flex; flex-direction: column; gap: 10px; }
-.detail-img { width: 100%; max-height: 360px; border: 1px solid #ebeef5; border-radius: 6px; background: #fafafa; }
+.img-stage { flex: 1 1 auto; min-height: 0; display: flex; align-items: center; justify-content: center; background: #fafafa; border: 1px solid #ebeef5; border-radius: 6px; overflow: hidden; }
+.stage-img { width: 100%; height: 100%; }
+.img-thumbs { display: flex; gap: 6px; margin-top: 8px; overflow-x: auto; padding-bottom: 2px; flex-shrink: 0; }
+.thumb { width: 52px; height: 52px; flex-shrink: 0; border: 2px solid transparent; border-radius: 4px; overflow: hidden; cursor: pointer; background: #f0f2f5; }
+.thumb.active { border-color: #409eff; }
+.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
 
 .q-list { display: flex; flex-direction: column; gap: 8px; }
 .q-item { border: 1px solid #ebeef5; border-left: 3px solid #dcdfe6; border-radius: 6px; padding: 8px 12px; background: #fff; }
@@ -840,11 +1048,19 @@ onBeforeUnmount(() => {
 .q-item.q-wrong { border-left-color: #f56c6c; }
 .q-item.q-partial { border-left-color: #e6a23c; }
 .q-item.q-blank { border-left-color: #909399; }
-.q-head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+.q-item.q-edit { border-left-color: #409eff; }
+.q-head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; flex-wrap: wrap; }
 .q-no { font-weight: 600; color: #303133; }
 .q-score { margin-left: auto; font-weight: 600; color: #409eff; }
 .q-row { font-size: 13px; color: #606266; line-height: 1.7; word-break: break-word; }
 .q-label { display: inline-block; min-width: 34px; color: #909399; margin-right: 6px; }
 .q-comment { color: #e6a23c; }
 .adopt-ai { font-weight: 600; color: #409eff; margin-right: 12px; }
+
+.edit-summary { border: 1px solid #ebeef5; border-radius: 6px; padding: 10px 12px; background: #fafafa; margin-bottom: 10px; }
+.edit-sum-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.edit-sum-row + .edit-sum-row { margin-top: 8px; }
+.edit-label { font-size: 13px; color: #606266; }
+.edit-sum { color: #409eff; }
+.edit-score { display: flex; align-items: center; gap: 4px; margin-left: auto; }
 </style>
