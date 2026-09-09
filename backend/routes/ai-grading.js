@@ -179,6 +179,43 @@ async function loadProviders() {
   return { enabled: !!enabled, providers, activeId: activeRow ? activeRow.value : '' };
 }
 
+// 图片上传压缩设置（全局、跨供应商）：压缩发生在前端上传时，与具体模型供应商无关。
+// 默认最长边 2048、体积阈值 3MB、JPEG 质量 0.9——手写小字对分辨率敏感，不宜压得过狠；
+// 看图/图形题对分辨率要求更高时，可在配置里调大最长边以保留细节。
+const DEFAULT_UPLOAD = { max_edge: 2048, threshold_mb: 3, quality: 0.9 };
+
+// 收敛压缩参数到安全范围，避免极端值导致前端 canvas 异常或图片被压糊
+function sanitizeUploadSettings(s) {
+  const max_edge = Number(s && s.max_edge);
+  const threshold_mb = Number(s && s.threshold_mb);
+  const quality = Number(s && s.quality);
+  return {
+    max_edge: Number.isFinite(max_edge) ? Math.min(Math.max(Math.round(max_edge), 512), 8192) : DEFAULT_UPLOAD.max_edge,
+    threshold_mb: Number.isFinite(threshold_mb) ? Math.min(Math.max(threshold_mb, 0), 50) : DEFAULT_UPLOAD.threshold_mb,
+    quality: Number.isFinite(quality) ? Math.min(Math.max(quality, 0.3), 1) : DEFAULT_UPLOAD.quality
+  };
+}
+
+async function loadUploadSettings() {
+  const db = await getMainDb();
+  const row = await db.get("SELECT value FROM settings WHERE key = 'ai_upload_settings'");
+  let s = DEFAULT_UPLOAD;
+  if (row && row.value) {
+    try {
+      const p = JSON.parse(row.value);
+      if (p && typeof p === 'object') s = { ...DEFAULT_UPLOAD, ...p };
+    } catch (e) { /* 损坏则回退默认 */ }
+  }
+  return sanitizeUploadSettings(s);
+}
+
+async function saveUploadSettings(raw) {
+  const s = sanitizeUploadSettings(raw || DEFAULT_UPLOAD);
+  const db = await getMainDb();
+  await setSetting(db, 'ai_upload_settings', JSON.stringify(s));
+  return s;
+}
+
 async function saveProviders(providers, activeId) {
   const db = await getMainDb();
   await setSetting(db, 'ai_providers', JSON.stringify(providers));
@@ -230,7 +267,7 @@ router.get('/ai-grading/config', async (req, res) => {
       system_prompt: p.system_prompt, api_key_set: !!p.api_key, api_key_masked: maskKey(p.api_key)
     }));
     const active = resolveActive(providers, activeId);
-    sendResponse(res, { enabled, providers: list, active_id: active ? active.id : '' });
+    sendResponse(res, { enabled, providers: list, active_id: active ? active.id : '', upload: await loadUploadSettings() });
   } catch (err) {
     sendResponse(res, null, err.message, 500);
   }
@@ -244,7 +281,11 @@ router.put('/ai-grading/config', async (req, res) => {
     const db = await getMainDb();
     await setSetting(db, 'ai_enabled', enabled);
     if (body.active_id !== undefined) await setSetting(db, 'ai_active_provider', String(body.active_id || ''));
-    sendResponse(res, { enabled: enabled === '1' }, '已保存');
+    let upload = await loadUploadSettings();
+    if (body.upload && typeof body.upload === 'object') {
+      upload = await saveUploadSettings(body.upload);
+    }
+    sendResponse(res, { enabled: enabled === '1', upload }, '已保存');
   } catch (err) {
     sendResponse(res, null, err.message, 500);
   }

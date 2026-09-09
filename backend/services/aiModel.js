@@ -137,12 +137,16 @@ const DEFAULT_SYSTEM_PROMPT = `你是一名严谨、经验丰富的教师，正�
 判分要求：
 - 只依据图片中可见的作答内容判分，无法辨认或未作答的题目按 0 分处理，并在该题点评中说明；
 - 客观题按对错判分，主观题按要点给分，允许给出部分分；
-- 若试卷未标注总分，一律按 100 分制估算各题满分；无法确定单题满分时按常见分值合理分配；
+- 分值识别（非常重要）：优先读取卷面上印刷/标注的分值（如「（本题 3 分）」「本大题共 12 分」「每小题 2 分」），据此填写每个小题的 full_score，不要凭空估一个与卷面不符的分值；
+- 分值层级必须自洽：每个大题的满分 = 该大题下各小题 full_score 之和；试卷满分 = 各题 full_score 之和。不要给大题或试卷另设一个与小题合计矛盾的分值；
+- 若卷面没有标注任何分值，一律按 100 分制为各题合理分配满分，且分配后各题满分之和 = 100；无法确定单题满分时按常见分值合理分配；
+- 每道题的 score 不得超过该题 full_score；
 - 保持严格、公正，分数为数字，不要带单位。
 
 输出要求（非常重要）：
 - 必须严格输出一个 JSON 对象，不要输出任何解释性文字、前后缀或 Markdown 代码块；
-- questions 数组的每个元素对应一个「最小计分单位」（即一个小题）；total_score 应等于各题 score 之和、full_score 应等于各题 full_score 之和；
+- questions 数组的每个元素对应一个「最小计分单位」（即一个小题）；total_score 应等于各题 score 之和、full_score 应等于各题 full_score 之和；group_full_score 应等于该大题下各小题 full_score 之和；
+- 同一大题的每个小题都填写相同的 group（大题号）与 group_full_score（该大题满分），便于核对分值层级；
 - 即使某题在图片中模糊、被遮挡或学生未作答，也要在 questions 中列出该题并把 result 标记为 blank、score 记为 0，不得省略；
 - 请直接输出答案 JSON，不要为节省篇幅而省略任何题目；
 - JSON 结构如下：
@@ -153,6 +157,8 @@ const DEFAULT_SYSTEM_PROMPT = `你是一名严谨、经验丰富的教师，正�
   "questions": [
     {
       "no": "题号",              // 大题无小题时如 "1"/"一"；含小题时用 "大题号-小题号"，如 "三-1"
+      "group": "大题号",          // 该小题所属大题的题号，如 "三"；大题本身不含小题时与 no 相同
+      "group_full_score": 数字,   // 该大题满分（应等于该大题下所有小题 full_score 之和）
       "question": "题目内容摘要（含图中关键条件）",
       "student_answer": "识别到的学生作答内容（含图上直接作答）",
       "score": 数字,             // 本题得分
@@ -323,6 +329,8 @@ function normalizeQuestion(q, i) {
   if (!q || typeof q !== 'object') return null;
   return finalizeQuestion({
     no: str(q.no ?? q.number ?? q.index ?? q['题号'] ?? i + 1),
+    group: str(q.group ?? q['大题'] ?? q['大题号'] ?? q['题组'] ?? ''),
+    group_full_score: num(q.group_full_score ?? q['大题满分'] ?? q['题组满分'], 0),
     question: str(q.question ?? q.title ?? q['题目'] ?? ''),
     student_answer: str(q.student_answer ?? q.answer ?? q['学生答案'] ?? q['作答'] ?? ''),
     score: num(q.score ?? q['得分'] ?? q['分数'], 0),

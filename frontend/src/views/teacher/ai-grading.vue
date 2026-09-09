@@ -211,15 +211,25 @@
               <template v-if="!editing">
                 <div class="section-title">逐题批改（{{ detailQuestions.length }} 题）</div>
                 <div class="q-list">
-                  <div v-for="(q, i) in detailQuestions" :key="i" class="q-item" :class="'q-' + q.result">
-                    <div class="q-head">
-                      <span class="q-no">第 {{ q.no }} 题</span>
-                      <el-tag :type="resultTag(q.result).type" size="small">{{ resultTag(q.result).label }}</el-tag>
-                      <span class="q-score">{{ q.score }} / {{ q.full_score }}</span>
+                  <div v-for="(g, gi) in groupedQuestions" :key="g.key" class="q-group">
+                    <div v-if="groupedQuestions.length > 1 || g.questions.length > 1" class="q-group-head">
+                      <span class="q-group-title">{{ g.title }}</span>
+                      <span class="q-group-count">{{ g.questions.length }} 小题</span>
+                      <span class="q-group-sum">满分 <b>{{ g.fullSum }}</b> · 得分 <b>{{ g.scoreSum }}</b></span>
+                      <el-tag v-if="g.declaredFull > 0 && Math.abs(g.declaredFull - g.fullSum) > 0.01" type="warning" size="small" effect="plain">
+                        模型标注满分 {{ g.declaredFull }} ≠ 各小题合计 {{ g.fullSum }}
+                      </el-tag>
                     </div>
-                    <div class="q-row" v-if="q.question"><span class="q-label">题目</span>{{ q.question }}</div>
-                    <div class="q-row" v-if="q.student_answer"><span class="q-label">作答</span>{{ q.student_answer }}</div>
-                    <div class="q-row q-comment" v-if="q.comment"><span class="q-label">点评</span>{{ q.comment }}</div>
+                    <div v-for="(q, i) in g.questions" :key="i" class="q-item" :class="'q-' + q.result">
+                      <div class="q-head">
+                        <span class="q-no">第 {{ q.no }} 题</span>
+                        <el-tag :type="resultTag(q.result).type" size="small">{{ resultTag(q.result).label }}</el-tag>
+                        <span class="q-score">{{ q.score }} / {{ q.full_score }}</span>
+                      </div>
+                      <div class="q-row" v-if="q.question"><span class="q-label">题目</span>{{ q.question }}</div>
+                      <div class="q-row" v-if="q.student_answer"><span class="q-label">作答</span>{{ q.student_answer }}</div>
+                      <div class="q-row q-comment" v-if="q.comment"><span class="q-label">点评</span>{{ q.comment }}</div>
+                    </div>
                   </div>
                   <el-empty v-if="!detailQuestions.length" description="模型未返回逐题明细" :image-size="60" />
                 </div>
@@ -244,26 +254,34 @@
                   </div>
                 </div>
                 <div class="q-list">
-                  <div v-for="(q, i) in editForm.questions" :key="i" class="q-item q-edit">
-                    <div class="q-head">
-                      <el-input v-model="q.no" size="small" style="width: 60px" placeholder="题号" />
-                      <el-select v-model="q.result" size="small" style="width: 110px">
-                        <el-option label="正确" value="correct" />
-                        <el-option label="部分正确" value="partial" />
-                        <el-option label="错误" value="wrong" />
-                        <el-option label="未作答" value="blank" />
-                      </el-select>
-                      <div class="edit-score">
-                        <span class="form-tip">得分</span>
-                        <el-input-number v-model="q.score" :min="0" :max="999" :precision="1" size="small" style="width: 88px" />
-                        <span class="form-tip">满分</span>
-                        <el-input-number v-model="q.full_score" :min="0" :max="999" :precision="1" size="small" style="width: 88px" />
-                      </div>
-                      <el-button link type="danger" size="small" @click="removeEditQuestion(i)">删除</el-button>
+                  <div v-for="(g, gi) in editGrouped" :key="g.key" class="q-group">
+                    <div v-if="editGrouped.length > 1 || g.questions.length > 1" class="q-group-head q-group-head-edit">
+                      <span class="q-group-title">{{ g.title }}</span>
+                      <span class="q-group-count">{{ g.questions.length }} 小题</span>
+                      <span class="q-group-sum">满分 <b>{{ g.fullSum }}</b> · 得分 <b>{{ g.scoreSum }}</b></span>
                     </div>
-                    <div class="q-row"><span class="q-label">题目</span><el-input v-model="q.question" type="textarea" :rows="1" size="small" /></div>
-                    <div class="q-row"><span class="q-label">作答</span><el-input v-model="q.student_answer" type="textarea" :rows="1" size="small" /></div>
-                    <div class="q-row"><span class="q-label">点评</span><el-input v-model="q.comment" type="textarea" :rows="1" size="small" /></div>
+                    <div v-for="(q, i) in g.questions" :key="i" class="q-item q-edit">
+                      <div class="q-head">
+                        <el-input v-model="q.no" size="small" style="width: 60px" placeholder="题号" />
+                        <el-input v-model="q.group" size="small" style="width: 70px" placeholder="大题号" />
+                        <el-select v-model="q.result" size="small" style="width: 110px">
+                          <el-option label="正确" value="correct" />
+                          <el-option label="部分正确" value="partial" />
+                          <el-option label="错误" value="wrong" />
+                          <el-option label="未作答" value="blank" />
+                        </el-select>
+                        <div class="edit-score">
+                          <span class="form-tip">得分</span>
+                          <el-input-number v-model="q.score" :min="0" :max="999" :precision="1" size="small" style="width: 88px" />
+                          <span class="form-tip">满分</span>
+                          <el-input-number v-model="q.full_score" :min="0" :max="999" :precision="1" size="small" style="width: 88px" />
+                        </div>
+                        <el-button link type="danger" size="small" @click="removeEditQuestion(q)">删除</el-button>
+                      </div>
+                      <div class="q-row"><span class="q-label">题目</span><el-input v-model="q.question" type="textarea" :rows="1" size="small" /></div>
+                      <div class="q-row"><span class="q-label">作答</span><el-input v-model="q.student_answer" type="textarea" :rows="1" size="small" /></div>
+                      <div class="q-row"><span class="q-label">点评</span><el-input v-model="q.comment" type="textarea" :rows="1" size="small" /></div>
+                    </div>
                   </div>
                   <el-empty v-if="!editForm.questions.length" description="暂无题目" :image-size="60" />
                   <el-button style="margin-top: 8px" size="small" plain @click="addEditQuestion">
@@ -328,6 +346,21 @@
         <span class="cfg-enabled-label">启用 AI 批改</span>
         <el-switch v-model="aiEnabledForm" />
         <span class="form-tip" style="margin-left: 10px">关闭后隐藏批改能力，不影响其它功能</span>
+      </div>
+
+      <div class="cfg-upload">
+        <span class="section-title">图片压缩（上传前自动处理）</span>
+        <div class="cfg-upload-row">
+          <span class="form-tip">最长边（像素）：</span>
+          <el-input-number v-model="uploadForm.max_edge" :min="512" :max="8192" :step="256" size="small" />
+          <span class="form-tip">体积阈值（MB）：</span>
+          <el-input-number v-model="uploadForm.threshold_mb" :min="0" :max="50" :step="1" :precision="1" size="small" />
+          <span class="form-tip">JPEG 质量：</span>
+          <el-input-number v-model="uploadForm.quality" :min="0.3" :max="1" :step="0.05" :precision="2" size="small" />
+        </div>
+        <div class="form-tip">
+          仅对「超过体积阈值」的图片按「最长边」等比缩放并转 JPEG。看图题/图形题对分辨率敏感，可调大最长边（如 3000）或调高体积阈值（如 0 表示不压缩）以保留细节；普通文字卷保持默认即可。
+        </div>
       </div>
 
       <div class="cfg-providers-head">
@@ -521,13 +554,22 @@ const onImageChange = (file, uploadFiles) => {
 // 会明显拉长模型的视觉编码时间（多图时首字节等待可达数分钟）并推高内存占用。
 // 只对「体积或长边超标」的 JPEG/PNG/WEBP 处理——手写小字对分辨率敏感，不能一刀切压小；
 // 任何一步异常或压缩后反而更大，都回退原图，保证图片数量与顺序完全不变。
-const MAX_EDGE = 2048
-const COMPRESS_THRESHOLD = 3 * 1024 * 1024
+// 压缩参数（最长边 / 体积阈值 / 质量）来自「AI 模型配置」的全局图片压缩设置，可随时调整；
+// 看图/图形题对分辨率敏感，可调大最长边以保留更多细节。
+const uploadSettings = computed(() => {
+  const u = aiInfo.value?.upload
+  return {
+    max_edge: Number(u?.max_edge) > 0 ? Number(u.max_edge) : 2048,
+    threshold_mb: Number(u?.threshold_mb) >= 0 ? Number(u.threshold_mb) : 3,
+    quality: Number(u?.quality) > 0 ? Number(u.quality) : 0.9
+  }
+})
 const compressImage = (file) => new Promise((resolve) => {
   const fallback = () => resolve(file)
   try {
     if (!file || !/^image\/(jpeg|png|webp)$/.test(file.type)) return fallback()
-    if (!file.size || file.size <= COMPRESS_THRESHOLD) return fallback()
+    const { max_edge, threshold_mb, quality } = uploadSettings.value
+    if (!file.size || file.size <= threshold_mb * 1024 * 1024) return fallback()
     const url = URL.createObjectURL(file)
     const img = new Image()
     img.onload = () => {
@@ -535,7 +577,7 @@ const compressImage = (file) => new Promise((resolve) => {
         const w = img.naturalWidth || 0
         const h = img.naturalHeight || 0
         if (!w || !h) { URL.revokeObjectURL(url); return fallback() }
-        const scale = Math.min(1, MAX_EDGE / Math.max(w, h))
+        const scale = Math.min(1, max_edge / Math.max(w, h))
         // 尺寸本来就没超，只是体积偏大：不重绘，避免无谓的画质损失
         if (scale >= 1) { URL.revokeObjectURL(url); return fallback() }
         const canvas = document.createElement('canvas')
@@ -547,7 +589,7 @@ const compressImage = (file) => new Promise((resolve) => {
           if (!blob || blob.size >= file.size) return fallback()
           const name = String(file.name || 'image').replace(/\.[^.]+$/, '') + '.jpg'
           resolve(new File([blob], name, { type: 'image/jpeg' }))
-        }, 'image/jpeg', 0.9)
+        }, 'image/jpeg', quality)
       } catch (e) {
         URL.revokeObjectURL(url)
         fallback()
@@ -639,6 +681,35 @@ const detailQuestions = computed(() => {
 })
 const taskImages = (t) => (t && t.image_path ? t.image_path.split(',').filter(Boolean) : [])
 
+// 把扁平 questions 按「大题」分组：优先用模型给的 group 字段，回退 no 的「大题号-小题号」前缀解析。
+// 每组汇总：大题满分 = 各小题 full_score 之和，得分 = 各小题 score 之和（可靠，不依赖模型自报的大题分）；
+// declaredFull 为模型标注的大题满分（可能不准），与求和不符时用于展示「分值有误」提示。
+const groupQuestions = (list) => {
+  const groups = []
+  const map = new Map()
+  for (const q of (list || [])) {
+    let key = (q.group || '').trim()
+    if (!key) {
+      const m = String(q.no || '').match(/^\s*(.+?)\s*[-.、·(（]\s*\d/)
+      key = m ? m[1].trim() : (String(q.no || '').trim() || '未分组')
+    }
+    if (!map.has(key)) {
+      const g = { key, title: key, questions: [], fullSum: 0, scoreSum: 0, declaredFull: 0 }
+      map.set(key, g)
+      groups.push(g)
+    }
+    const g = map.get(key)
+    g.questions.push(q)
+    g.fullSum = Math.round((g.fullSum + (Number(q.full_score) || 0)) * 100) / 100
+    g.scoreSum = Math.round((g.scoreSum + (Number(q.score) || 0)) * 100) / 100
+    if (!g.declaredFull && Number(q.group_full_score) > 0) g.declaredFull = Number(q.group_full_score)
+  }
+  return groups
+}
+const groupedQuestions = computed(() => groupQuestions(detailQuestions.value))
+// 编辑态分组（editForm.questions 是扁平数组，同样按大题聚合并实时汇总）
+const editGrouped = computed(() => groupQuestions(editForm.value.questions))
+
 // 原图常驻：左栏单图舞台 + 缩略图切换；右栏题目滚动时左边图片始终可见
 const activeImgIndex = ref(0)
 const imageSrcList = computed(() => taskImages(currentTask.value).map(x => `/uploads/${x}`))
@@ -674,11 +745,12 @@ const startEdit = () => {
 }
 const addEditQuestion = () => {
   editForm.value.questions.push({
-    no: '', question: '', student_answer: '', score: 0, full_score: 0, result: 'unknown', comment: ''
+    no: '', group: '', group_full_score: 0, question: '', student_answer: '', score: 0, full_score: 0, result: 'unknown', comment: ''
   })
 }
-const removeEditQuestion = (i) => {
-  editForm.value.questions.splice(i, 1)
+const removeEditQuestion = (q) => {
+  const i = editForm.value.questions.indexOf(q)
+  if (i >= 0) editForm.value.questions.splice(i, 1)
 }
 const saveEdit = async () => {
   if (!currentTask.value) return
@@ -800,6 +872,8 @@ const removeTask = async (task) => {
 const configVisible = ref(false)
 const savingConfig = ref(false)
 const aiEnabledForm = ref(false)
+// 图片压缩（全局）表单：最长边 / 体积阈值 / JPEG 质量
+const uploadForm = ref({ max_edge: 2048, threshold_mb: 3, quality: 0.9 })
 
 // 供应商编辑子弹窗
 const providerVisible = ref(false)
@@ -820,13 +894,19 @@ const loadConfig = async () => {
 const openConfig = async () => {
   await loadConfig()
   aiEnabledForm.value = !!aiInfo.value.enabled
+  const u = aiInfo.value.upload || {}
+  uploadForm.value = {
+    max_edge: Number(u.max_edge) > 0 ? Number(u.max_edge) : 2048,
+    threshold_mb: Number(u.threshold_mb) >= 0 ? Number(u.threshold_mb) : 3,
+    quality: Number(u.quality) > 0 ? Number(u.quality) : 0.9
+  }
   configVisible.value = true
 }
-// 保存总开关（当前激活供应商在切换时已即时保存）
+// 保存总开关 + 图片压缩设置（当前激活供应商在切换时已即时保存）
 const saveConfig = async () => {
   savingConfig.value = true
   try {
-    await saveAiConfig({ enabled: aiEnabledForm.value, active_id: aiInfo.value.active_id })
+    await saveAiConfig({ enabled: aiEnabledForm.value, active_id: aiInfo.value.active_id, upload: uploadForm.value })
     ElMessage.success('已保存')
     configVisible.value = false
     await loadConfig()
@@ -1007,6 +1087,8 @@ onBeforeUnmount(() => {
 .mb-16 { margin-bottom: 16px; }
 .cfg-enabled { display: flex; align-items: center; margin-bottom: 16px; }
 .cfg-enabled-label { font-size: 14px; font-weight: 600; color: #303133; margin-right: 12px; }
+.cfg-upload { border: 1px solid #ebeef5; border-radius: 6px; padding: 10px 12px; background: #fafafa; margin-bottom: 16px; }
+.cfg-upload-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
 .cfg-providers-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
 .topbar { display: flex; justify-content: space-between; align-items: center; }
 .topbar-left { display: flex; align-items: center; gap: 10px; }
@@ -1043,6 +1125,13 @@ onBeforeUnmount(() => {
 .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
 
 .q-list { display: flex; flex-direction: column; gap: 8px; }
+.q-group { display: flex; flex-direction: column; gap: 8px; }
+.q-group-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 6px 10px; background: #f5f7fa; border: 1px solid #ebeef5; border-left: 3px solid #409eff; border-radius: 6px; }
+.q-group-head-edit { border-left-color: #67c23a; }
+.q-group-title { font-weight: 600; color: #303133; }
+.q-group-count { font-size: 12px; color: #909399; }
+.q-group-sum { margin-left: auto; font-size: 13px; color: #606266; }
+.q-group-sum b { color: #409eff; font-weight: 600; }
 .q-item { border: 1px solid #ebeef5; border-left: 3px solid #dcdfe6; border-radius: 6px; padding: 8px 12px; background: #fff; }
 .q-item.q-correct { border-left-color: #67c23a; }
 .q-item.q-wrong { border-left-color: #f56c6c; }
