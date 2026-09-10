@@ -33,12 +33,18 @@ const imageFileFilter = (req, file, cb) => {
   cb(null, true);
 };
 
-// 限制单文件 10MB、最多 6 张：AI 以 base64 内联传图，超大图片会使请求体与内存暴涨甚至 OOM
-const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024, files: 6 }, fileFilter: imageFileFilter });
+// 限制单文件 10MB、最多 12 张（试卷图 6 + 答案图 6）：AI 以 base64 内联传图，
+// 超大图片会使请求体与内存暴涨甚至 OOM。各字段的 maxCount 在 upload.fields 里单独约束。
+const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024, files: 12 }, fileFilter: imageFileFilter });
 
-// 包装上传中间件：把 multer 的英文错误码转成对用户友好的中文提示
+// 包装上传中间件：把 multer 的英文错误码转成对用户友好的中文提示。
+// 与试卷图片共用同一套 storage/fileFilter/limits（同为 ai- 前缀、同为图片），
+// 答案图片与试卷图片合并在一次 multipart 请求里上传：试卷图走 images 字段、答案图走 answer_images 字段。
 const uploadImages = (req, res, next) => {
-  upload.array('images', 6)(req, res, (err) => {
+  upload.fields([
+    { name: 'images', maxCount: 6 },
+    { name: 'answer_images', maxCount: 6 }
+  ])(req, res, (err) => {
     if (!err) return next();
     const msg = err.code === 'LIMIT_FILE_SIZE' ? '单张试卷图片不能超过 10MB，请压缩后重试'
       : err.code === 'LIMIT_FILE_COUNT' ? '单次最多上传 6 张试卷图片'
@@ -500,6 +506,66 @@ function examContentToText(content) {
   }
 }
 
+// ============ AI 批改标准答案（参考答案） ============
+// 答案存 exams.answer_ref（试卷级属性），一次录入、多次批改复用；不随批改任务删除而丢失。
+// answer_ref 为 JSON 字符串，结构：
+//   { mode: 'text'|'image'|'none', text: '...', images: ['ai-ans-...jpg'], parsed: {...} }
+// parsed 为「题号 -> 答案」映射，由文本解析而来（尽力而为，解析失败时仍保留原文供模型自行理解）。
+// 说明：答案文件（.txt/.md/.csv）由前端读取文本内容后走「文本」通道（answer_text）提交，
+//       后端无需额外解析文件，故文件输入口复用文本逻辑、零新增后端复杂度。
+
+// 从自由文本中尽力解析「题号 -> 答案」映射：按行处理，识别行首的题号前缀（如 "1." "1、" "1)" "第1题"）。
+// 缩进行视为上一题答案的续行；解析失败不报错——返回空对象，文本原文仍会原样下发给模型。
+function parseAnswerText(text) {
+  const s = String(text || '');
+  const map = {};
+  if (!s.trim()) return map;
+  const lines = s.split(/\r?\n/);
+  let lastNo = null;
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    // 原行有前导空白 => 上一题答案的续行
+    if (/^\s/.test(raw) && lastNo !== null) {
+      map[lastNo] = (map[lastNo] !== undefined ? map[lastNo] + '\n' : '') + line;
+      continue;
+    }
+    // 行首题号：数字/中文数字 + 可选「题」字 + 可选分隔符（. 、 ) ）: ： 】）
+    const m = line.match(/^(?:第\s*)?([0-9一二三四五六七八九十]+)\s*(?:题)?\s*[.、)）:：】]?\s*(.*)$/);
+    if (m && m[1]) {
+      lastNo = m[1];
+      const ans = m[2].trim();
+      if (ans) map[lastNo] = ans;
+    } else if (lastNo !== null) {
+      // 无缩进的普通续行
+      if (map[lastNo] !== undefined) map[lastNo] += '\n' + line;
+    }
+  }
+  return map;
+}
+
+// 归一化 answer_ref 对象：校验 mode 枚举、收敛字段，返回 null 表示「无答案」。
+function normalizeAnswerRef(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const mode = raw.mode === 'text' || raw.mode === 'image' ? raw.mode : null;
+  if (!mode) return null;
+  const text = String(raw.text || '').slice(0, 20000);
+  const images = Array.isArray(raw.images)
+    ? raw.images.map(x => path.basename(String(x))).filter(x => x && x.startsWith('ai-') && !x.includes('..')).slice(0, 6)
+    : [];
+  if (mode === 'text' && !text.trim() && !images.length) return null;
+  if (mode === 'image' && !images.length && !text.trim()) return null;
+  const parsed = (mode === 'text' && text.trim()) ? parseAnswerText(text) : (raw.parsed && typeof raw.parsed === 'object' ? raw.parsed : {});
+  return { mode, text, images, parsed };
+}
+
+// 判断某张试卷是否已录入答案
+async function getExamAnswerRef(db, examId) {
+  const row = await db.get('SELECT answer_ref FROM exams WHERE id = ?', [examId]);
+  if (!row || !row.answer_ref) return null;
+  try { return JSON.parse(row.answer_ref); } catch (e) { return null; }
+}
+
 // GET /ai-grading/tasks - 任务列表（不含 detail 大字段）
 router.get('/ai-grading/tasks', async (req, res) => {
   try {
@@ -530,6 +596,8 @@ router.get('/ai-grading/tasks', async (req, res) => {
 });
 
 // POST /ai-grading/tasks - 创建批改任务（新上传图片，或复用该生该考试已有照片）
+// 支持附带标准答案：answer_text（纯文本）或 answer_images（答案图片，走 answer_images 字段）。
+// 答案存试卷级（exams.answer_ref），一次录入、后续批改自动复用。
 router.post('/ai-grading/tasks', uploadImages, async (req, res) => {
   try {
     const { enabled, config } = await loadActiveConfig();
@@ -542,10 +610,34 @@ router.post('/ai-grading/tasks', uploadImages, async (req, res) => {
     if (!exam_id || !student_id) return sendResponse(res, null, 'exam_id 与 student_id 不能为空', 400);
 
     const db = await getDb();
-    const exam = await db.get('SELECT id, title, subject, content FROM exams WHERE id = ?', [exam_id]);
+    const exam = await db.get('SELECT id, title, subject, content, answer_ref FROM exams WHERE id = ?', [exam_id]);
     if (!exam) return sendResponse(res, null, '试卷不存在', 404);
     const student = await db.get('SELECT id, name FROM students WHERE id = ?', [student_id]);
     if (!student) return sendResponse(res, null, '学生不存在', 404);
+
+    // 本次上传的答案图片（若有）
+    const answerImages = (req.files && req.files.answer_images)
+      ? req.files.answer_images.map(f => f.filename)
+      : [];
+
+    // 解析本次提交的答案（文本 + 图片）；未提交则回退试卷级已存答案
+    const answerTextRaw = String(req.body.answer_text || '').trim();
+    let answerRef = null;
+    if (answerTextRaw || answerImages.length) {
+      answerRef = normalizeAnswerRef({
+        mode: 'text',
+        text: answerTextRaw,
+        images: answerImages
+      });
+      if (answerRef) {
+        // 持久化到试卷级：一次录入、多次批改复用。答案文本可留空（仅图片），图片可留空（仅文本）。
+        await db.run('UPDATE exams SET answer_ref = ? WHERE id = ?', [JSON.stringify(answerRef), exam_id]);
+      }
+    }
+    if (!answerRef) {
+      // 本次未提供答案，读取试卷级已存答案（复用）
+      answerRef = await getExamAnswerRef(db, exam_id);
+    }
 
     // 重复提交保护：同一学生同一试卷已有在跑的任务时直接复用。
     // 老师连点两次就会发起两次完整调用（本地模型一次要几分钟），既浪费也更容易把服务压垮。
@@ -554,19 +646,21 @@ router.post('/ai-grading/tasks', uploadImages, async (req, res) => {
       [exam_id, student_id]
     );
     if (dup) {
-      cleanupUploaded(req.files);
+      cleanupUploaded(req.files && req.files.images);
+      cleanupUploaded(req.files && req.files.answer_images);
       return sendResponse(res, { id: dup.id, status: dup.status, reused: true }, '该学生的这份试卷正在批改中，已为你打开已有任务');
     }
 
     // 图片来源：优先本次上传；否则复用该生该考试记录里已有的试卷照片
     let imageFiles = [];
-    if (req.files && req.files.length) {
-      imageFiles = req.files.map(f => f.filename);
+    if (req.files && req.files.images && req.files.images.length) {
+      imageFiles = req.files.images.map(f => f.filename);
     } else {
       const rec = await db.get('SELECT image_path FROM exam_records WHERE exam_id = ? AND student_id = ?', [exam_id, student_id]);
       if (rec && rec.image_path) imageFiles = rec.image_path.split(',').map(s => s.trim()).filter(Boolean);
     }
     if (!imageFiles.length) {
+      cleanupUploaded(req.files && req.files.answer_images);
       return sendResponse(res, null, '请上传试卷图片，或确保该学生已有试卷照片', 400);
     }
 
@@ -577,11 +671,48 @@ router.post('/ai-grading/tasks', uploadImages, async (req, res) => {
     const taskId = result.lastID;
 
     const ctx = getClassContext();
-    const examContext = { title: exam.title, subject: exam.subject, content: examContentToText(exam.content) };
+    const examContext = {
+      title: exam.title,
+      subject: exam.subject,
+      content: examContentToText(exam.content),
+      answer_ref: answerRef
+    };
     // 后台执行，不阻塞响应（LLM 调用耗时长，前端改为轮询任务状态）；经队列限流后启动
     enqueueGrading(taskId, ctx, config, imageFiles, examContext);
 
-    sendResponse(res, { id: taskId, status: 'pending' });
+    sendResponse(res, { id: taskId, status: 'pending', has_answer: !!answerRef });
+  } catch (err) {
+    sendResponse(res, null, err.message, 500);
+  }
+});
+
+// GET /ai-grading/exams/:id/answer-ref - 读取某张试卷已录入的标准答案
+router.get('/ai-grading/exams/:id/answer-ref', async (req, res) => {
+  try {
+    const db = await getDb();
+    const answerRef = await getExamAnswerRef(db, req.params.id);
+    sendResponse(res, { answer_ref: answerRef });
+  } catch (err) {
+    sendResponse(res, null, err.message, 500);
+  }
+});
+
+// PUT /ai-grading/exams/:id/answer-ref - 保存/清空某张试卷的标准答案
+// body: { answer_ref: {...} } 保存；{ answer_ref: null } 清空
+router.put('/ai-grading/exams/:id/answer-ref', async (req, res) => {
+  try {
+    const db = await getDb();
+    const exam = await db.get('SELECT id FROM exams WHERE id = ?', [req.params.id]);
+    if (!exam) return sendResponse(res, null, '试卷不存在', 404);
+    const body = req.body || {};
+    if (body.answer_ref === null || body.answer_ref === undefined) {
+      await db.run('UPDATE exams SET answer_ref = NULL WHERE id = ?', [req.params.id]);
+      return sendResponse(res, { answer_ref: null }, '已清空答案');
+    }
+    const answerRef = normalizeAnswerRef(body.answer_ref);
+    if (!answerRef) return sendResponse(res, null, '答案内容为空或格式不正确', 400);
+    await db.run('UPDATE exams SET answer_ref = ? WHERE id = ?', [JSON.stringify(answerRef), req.params.id]);
+    sendResponse(res, { answer_ref: answerRef }, '答案已保存');
   } catch (err) {
     sendResponse(res, null, err.message, 500);
   }

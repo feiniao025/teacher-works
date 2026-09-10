@@ -180,6 +180,7 @@ async function initClassDb(db) {
       content TEXT,
       resource_id INTEGER,
       analyze INTEGER DEFAULT 0,
+      answer_ref TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (resource_id) REFERENCES resources(id)
     );
@@ -420,6 +421,11 @@ async function initClassDb(db) {
   try {
     await db.run('ALTER TABLE exams ADD COLUMN subject TEXT');
   } catch (e) { /* subject 列已存在，忽略 */ }
+
+  // 为已存在的 exams 表追加 answer_ref 列（AI 批改标准答案，JSON：mode/text/images/parsed）
+  try {
+    await db.run('ALTER TABLE exams ADD COLUMN answer_ref TEXT');
+  } catch (e) { /* answer_ref 列已存在，忽略 */ }
 
   // 为已存在的 exam_records 表追加 image_path 列（考试记录图片，逗号分隔）
   try {

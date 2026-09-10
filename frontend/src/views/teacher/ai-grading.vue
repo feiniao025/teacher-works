@@ -39,7 +39,7 @@
       <template #header><span class="card-title">发起 AI 批改</span></template>
       <el-form :inline="true" class="start-form">
         <el-form-item label="试卷">
-          <el-select v-model="newForm.exam_id" placeholder="选择试卷" filterable style="width: 260px">
+          <el-select v-model="newForm.exam_id" placeholder="选择试卷" filterable style="width: 260px" @change="onExamChange">
             <el-option v-for="e in exams" :key="e.id" :label="e.title" :value="e.id">
               <span>{{ e.title }}</span>
               <el-tag v-if="e.subject" size="small" type="warning" style="margin-left: 6px">{{ e.subject }}</el-tag>
@@ -69,6 +69,69 @@
         上传该学生的试卷照片（可多张，越清晰越准）。若不上传，将自动使用其在「试卷管理 → 考试记录」中已有的试卷照片。
         支持 JPG / PNG / WEBP；iPhone 的 HEIC 请先在相册中另存为 JPG。过大的照片会在上传前自动压缩，以缩短等待时间。
       </div>
+
+      <!-- 标准答案（参考答案）：选填。有答案时 AI 以答案为准判分，更准确；答案存试卷级，录入一次、后续批改自动复用 -->
+      <div class="answer-block">
+        <div class="answer-head">
+          <span class="section-title">参考答案（选填，可显著提升判分准确率）</span>
+          <el-button v-if="hasStoredAnswer" link type="danger" size="small" @click="clearAnswer">清空已存答案</el-button>
+        </div>
+        <el-alert
+          v-if="hasStoredAnswer"
+          type="success" :closable="false" show-icon style="margin-bottom: 8px"
+          :title="'该试卷已录入参考答案' + (storedAnswerSummary ? '（' + storedAnswerSummary + '）' : '') + '，本次批改将自动使用；如需修改可重新填写并覆盖。'"
+        />
+        <el-radio-group v-model="answerMode" size="small" style="margin-bottom: 8px">
+          <el-radio-button value="none">不提供</el-radio-button>
+          <el-radio-button value="text">文本输入</el-radio-button>
+          <el-radio-button value="file">答案文件</el-radio-button>
+          <el-radio-button value="image">答案图片</el-radio-button>
+        </el-radio-group>
+
+        <div v-if="answerMode === 'text'" style="margin-bottom: 6px">
+          <el-input
+            v-model="answerText"
+            type="textarea"
+            :rows="4"
+            placeholder="按行输入每题答案，如：&#10;1. A&#10;2. 42&#10;3. 略（本题解答要点：……）&#10;支持中文题号（一、二、三）"
+          />
+          <div class="form-tip">可留空只填部分题；未填答案的题 AI 将按常规自行判断。</div>
+        </div>
+
+        <div v-if="answerMode === 'file'" style="margin-bottom: 6px">
+          <el-upload
+            ref="answerFileRef"
+            :auto-upload="false"
+            :limit="1"
+            accept=".txt,.md,.csv"
+            :on-change="onAnswerFileChange"
+            :on-remove="onAnswerFileChange"
+          >
+            <el-button size="small" plain><el-icon><Upload /></el-icon>选择答案文件</el-button>
+          </el-upload>
+          <div class="form-tip" v-if="answerFileText">
+            已读取文件「{{ answerFileName }}」（{{ answerFileText.length }} 字），内容将作为参考答案提交。
+          </div>
+          <div class="form-tip" v-else>支持 .txt / .md / .csv 文件，按「题号 + 答案」分行，读取后作为文本答案提交。</div>
+        </div>
+
+        <div v-if="answerMode === 'image'" style="margin-bottom: 6px">
+          <el-upload
+            ref="answerUploadRef"
+            :auto-upload="false"
+            :limit="6"
+            accept="image/jpeg,image/png,image/webp,image/bmp,image/gif"
+            multiple
+            list-type="picture-card"
+            :on-change="onAnswerImageChange"
+            :on-remove="onAnswerImageChange"
+          >
+            <el-icon><Plus /></el-icon>
+          </el-upload>
+          <div class="form-tip">上传写有标准答案的照片（答案卷/教师用书/参考答案页），AI 将据图核对判分。</div>
+        </div>
+      </div>
+
       <div style="margin-top: 14px">
         <el-button type="primary" :loading="starting" :disabled="!aiEnabled" @click="startGrading">
           <el-icon><MagicStick /></el-icon>开始批改
@@ -517,7 +580,7 @@ import {
   getAiPresets, getAiConfig, saveAiConfig, testAiConnection,
   addAiProvider, updateAiProvider, deleteAiProvider, activateAiProvider, testAiProvider,
   getAiTasks, createAiTask, getAiTask, adoptAiTask, editAiTaskResult, deleteAiTask, exportAiTask,
-  getExams, getStudents
+  getExams, getStudents, getExamAnswerRef, saveExamAnswerRef
 } from '../../api'
 
 // ---------- 状态 ----------
@@ -545,6 +608,89 @@ const configSummary = computed(() => {
 const newForm = ref({ exam_id: null, student_id: null })
 const uploadRef = ref()
 const imageFiles = ref([])
+
+// ---------- 标准答案（参考答案） ----------
+const answerMode = ref('none') // none / text / file / image
+const answerText = ref('')
+const answerUploadRef = ref()
+const answerImageFiles = ref([])
+const answerFileRef = ref()
+const answerFileText = ref('')
+const answerFileName = ref('')
+const storedAnswer = ref(null) // 试卷级已存答案（answer_ref）
+
+// 是否已有已存答案（用于顶部提示与「清空」按钮）
+const hasStoredAnswer = computed(() => {
+  const a = storedAnswer.value
+  if (!a) return false
+  if (a.mode === 'text' && a.text && a.text.trim()) return true
+  if (a.mode === 'image' && Array.isArray(a.images) && a.images.length) return true
+  return false
+})
+// 已存答案摘要（用于提示文案）
+const storedAnswerSummary = computed(() => {
+  const a = storedAnswer.value
+  if (!a) return ''
+  if (a.mode === 'text') {
+    const n = a.text ? String(a.text).split('\n').filter(l => l.trim()).length : 0
+    return `文本 ${n} 行`
+  }
+  if (a.mode === 'image') return `图片 ${(a.images || []).length} 张`
+  return ''
+})
+
+const onAnswerImageChange = (file, uploadFiles) => {
+  answerImageFiles.value = (uploadFiles || []).map(f => f.raw).filter(Boolean)
+}
+
+// 答案文件：读取 .txt/.md/.csv 文本内容，作为「文本答案」提交（前端读内容、后端走文本通道，零新增后端复杂度）
+const onAnswerFileChange = (file, uploadFiles) => {
+  const list = (uploadFiles || []).map(f => f.raw).filter(Boolean)
+  if (!list.length) {
+    answerFileText.value = ''
+    answerFileName.value = ''
+    return
+  }
+  const f = list[0]
+  if (f.size > 2 * 1024 * 1024) {
+    ElMessage.warning('答案文件不能超过 2MB')
+    answerFileRef.value?.clearFiles()
+    answerFileText.value = ''
+    answerFileName.value = ''
+    return
+  }
+  const reader = new FileReader()
+  reader.onload = () => {
+    answerFileText.value = String(reader.result || '')
+    answerFileName.value = f.name || ''
+  }
+  reader.onerror = () => {
+    ElMessage.error('文件读取失败，请重试或改用文本输入')
+    answerFileText.value = ''
+    answerFileName.value = ''
+  }
+  reader.readAsText(f, 'utf-8')
+}
+
+// 选择试卷后加载该试卷已存答案
+const onExamChange = async (examId) => {
+  storedAnswer.value = null
+  if (!examId) return
+  try {
+    const r = await getExamAnswerRef(examId)
+    storedAnswer.value = (r && r.answer_ref) || null
+  } catch (e) { /* 拦截器已提示 */ }
+}
+
+// 清空已存答案
+const clearAnswer = async () => {
+  if (!newForm.value.exam_id) return
+  try {
+    await saveExamAnswerRef(newForm.value.exam_id, null)
+    storedAnswer.value = null
+    ElMessage.success('已清空该试卷的参考答案')
+  } catch (e) { /* 拦截器已提示 */ }
+}
 
 const onImageChange = (file, uploadFiles) => {
   imageFiles.value = (uploadFiles || []).map(f => f.raw).filter(Boolean)
@@ -614,10 +760,25 @@ const startGrading = async () => {
     const files = []
     for (const f of imageFiles.value) files.push(await compressImage(f))
     files.forEach(f => fd.append('images', f))
+    // 标准答案：文本 / 文件（前端读文本）/ 图片（均可同传，后端合并；均未提供则复用试卷级已存答案）
+    const finalAnswerText = answerMode.value === 'file' ? answerFileText.value : answerText.value
+    if ((answerMode.value === 'text' || answerMode.value === 'file') && finalAnswerText.trim()) {
+      fd.append('answer_text', finalAnswerText)
+    }
+    if (answerMode.value === 'image' && answerImageFiles.value.length) {
+      const ansFiles = []
+      for (const f of answerImageFiles.value) ansFiles.push(await compressImage(f))
+      ansFiles.forEach(f => fd.append('answer_images', f))
+    }
     const r = await createAiTask(fd)
     ElMessage.success('已提交批改，AI 正在处理…')
     uploadRef.value?.clearFiles()
     imageFiles.value = []
+    answerUploadRef.value?.clearFiles()
+    answerImageFiles.value = []
+    answerFileRef.value?.clearFiles()
+    answerFileText.value = ''
+    answerFileName.value = ''
     await loadTasks()
     // 打开详情并轮询进度
     const created = tasks.value.find(t => t.id === r.id)
@@ -1097,6 +1258,8 @@ onBeforeUnmount(() => {
 .card-title { font-weight: 600; }
 .card-title-row { display: flex; justify-content: space-between; align-items: center; }
 .start-form { margin-bottom: 4px; }
+.answer-block { border: 1px solid #ebeef5; border-radius: 6px; padding: 10px 12px; background: #fafafa; margin-top: 12px; }
+.answer-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
 .form-tip { font-size: 12px; color: #909399; margin-top: 6px; line-height: 1.6; }
 .text-muted { color: #c0c4cc; }
 .full { color: #909399; font-size: 12px; }
