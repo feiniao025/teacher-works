@@ -686,6 +686,104 @@ router.post('/ai-grading/tasks', uploadImages, async (req, res) => {
   }
 });
 
+// POST /ai-grading/tasks/batch - 批量批改：一次把某张试卷下「已有试卷照片」的学生全部发起批改。
+// 与单任务创建共用同一套能力（图片复用 / 答案复用 / 并发队列 / 重复保护），仅多一层「逐个学生遍历」。
+// 关键安全边界：
+//  1) 无照片的学生绝不建任务（只返回名单，由前端提示老师去补照片）；
+//  2) 已有 pending/processing 任务的学生直接跳过（复用现有 dup 保护，避免重复烧钱/重复批改）；
+//  3) 答案（answer_ref）为试卷级，自动复用到每个学生，无需重复录入。
+router.post('/ai-grading/tasks/batch', async (req, res) => {
+  try {
+    const { enabled, config } = await loadActiveConfig();
+    if (!enabled) return sendResponse(res, null, 'AI 批改功能未开启，请先在「模型配置」中开启并保存', 400);
+    if (!config.base_url || !config.model) {
+      return sendResponse(res, null, '模型未正确配置（缺少服务地址或模型名），请先完成配置', 400);
+    }
+
+    const { exam_id, student_ids } = req.body || {};
+    if (!exam_id) return sendResponse(res, null, 'exam_id 不能为空', 400);
+
+    const db = await getDb();
+    const exam = await db.get('SELECT id, title, subject, content, answer_ref FROM exams WHERE id = ?', [exam_id]);
+    if (!exam) return sendResponse(res, null, '试卷不存在', 404);
+
+    // 答案：批量场景复用试卷级已存答案（若有）；本次无答案输入口，保持与单任务「复用已存答案」一致
+    const answerRef = await getExamAnswerRef(db, exam_id);
+    const examContext = {
+      title: exam.title,
+      subject: exam.subject,
+      content: examContentToText(exam.content),
+      answer_ref: answerRef
+    };
+
+    // 学生范围：未指定 student_ids 时，取该试卷考试记录里的全部学生（即「已录入该考试」的学生）
+    let targets;
+    if (Array.isArray(student_ids) && student_ids.length) {
+      const ids = [...new Set(student_ids.map(x => Number(x)).filter(Number.isFinite))];
+      if (!ids.length) return sendResponse(res, null, '学生列表为空', 400);
+      const ph = ids.map(() => '?').join(',');
+      targets = await db.all(`SELECT s.id, s.name FROM students s WHERE s.id IN (${ph})`, ids);
+    } else {
+      targets = await db.all(`
+        SELECT s.id, s.name FROM exam_records er
+        JOIN students s ON er.student_id = s.id
+        WHERE er.exam_id = ?
+        ORDER BY s.id ASC
+      `, [exam_id]);
+    }
+
+    const ctx = getClassContext();
+    const created = [];
+    const skipped_no_image = [];
+    const skipped_running = [];
+    const skipped_no_student = [];
+
+    for (const stu of targets) {
+      const sid = stu.id;
+      // 重复保护：该生该卷已有在跑任务则跳过（与单任务创建口径一致）
+      const dup = await db.get(
+        "SELECT id, status FROM ai_grading_tasks WHERE exam_id = ? AND student_id = ? AND status IN ('pending','processing') ORDER BY id DESC LIMIT 1",
+        [exam_id, sid]
+      );
+      if (dup) {
+        skipped_running.push({ id: sid, name: stu.name, task_id: dup.id });
+        continue;
+      }
+
+      // 图片来源：复用该生该考试记录里已有的试卷照片（批量场景不上传新图）
+      const rec = await db.get('SELECT image_path FROM exam_records WHERE exam_id = ? AND student_id = ?', [exam_id, sid]);
+      const imageFiles = rec && rec.image_path
+        ? rec.image_path.split(',').map(s => s.trim()).filter(Boolean)
+        : [];
+      if (!imageFiles.length) {
+        skipped_no_image.push({ id: sid, name: stu.name });
+        continue;
+      }
+
+      const result = await db.run(
+        `INSERT INTO ai_grading_tasks (exam_id, student_id, image_path, status, model) VALUES (?, ?, ?, 'pending', ?)`,
+        [exam_id, sid, imageFiles.join(','), config.model]
+      );
+      const taskId = result.lastID;
+      created.push({ id: sid, name: stu.name, task_id: taskId });
+      enqueueGrading(taskId, ctx, config, imageFiles, examContext);
+    }
+
+    sendResponse(res, {
+      total: targets.length,
+      created: created.length,
+      task_ids: created.map(c => c.task_id),
+      created_students: created.map(c => ({ id: c.id, name: c.name })),
+      skipped_no_image,
+      skipped_running,
+      skipped_no_student,
+      has_answer: !!answerRef
+    }, `已发起 ${created.length} 份批改`);
+  } catch (err) {
+    sendResponse(res, null, err.message, 500);
+  }
+});
+
 // GET /ai-grading/exams/:id/answer-ref - 读取某张试卷已录入的标准答案
 router.get('/ai-grading/exams/:id/answer-ref', async (req, res) => {
   try {

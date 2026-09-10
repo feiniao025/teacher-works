@@ -136,7 +136,33 @@
         <el-button type="primary" :loading="starting" :disabled="!aiEnabled" @click="startGrading">
           <el-icon><MagicStick /></el-icon>开始批改
         </el-button>
+        <el-button type="success" plain :loading="batching" :disabled="!aiEnabled" @click="openBatch">
+          <el-icon><DataAnalysis /></el-icon>批量批改整卷
+        </el-button>
         <span v-if="!aiEnabled" class="form-tip" style="margin-left: 10px">请先开启并配置 AI 功能</span>
+      </div>
+
+      <!-- 批量批改进度面板：整卷批量发起后实时展示进度与结果，支持一键查看/采纳 -->
+      <div v-if="batchVisible" class="batch-panel">
+        <div class="batch-head">
+          <span class="section-title">批量批改进度 · {{ batchExamTitle }}</span>
+          <el-button link type="primary" size="small" @click="closeBatch">收起</el-button>
+        </div>
+        <el-progress
+          :percentage="batchProgress.percent"
+          :status="batchProgress.done === batchProgress.total && batchProgress.total > 0 ? 'success' : ''"
+          style="margin-bottom: 10px"
+        />
+        <div class="batch-stat">
+          <el-tag size="small" type="info">总数 {{ batchProgress.total }}</el-tag>
+          <el-tag size="small" type="success">已完成 {{ batchProgress.done }}</el-tag>
+          <el-tag size="small" type="warning">批改中 {{ batchProgress.running }}</el-tag>
+          <el-tag size="small" type="danger">失败 {{ batchProgress.failed }}</el-tag>
+          <el-tag size="small" type="info">待处理 {{ batchProgress.pending }}</el-tag>
+        </div>
+        <div v-if="batchProgress.total > 0 && batchProgress.done === batchProgress.total" class="form-tip">
+          全部批改完成。可在下方「批改记录」里逐个查看并采纳到成绩。
+        </div>
       </div>
     </el-card>
 
@@ -403,6 +429,54 @@
       </template>
     </el-dialog>
 
+    <!-- 批量批改预检对话框：列出有照片/无照片学生，勾选要批改的范围 -->
+    <el-dialog v-model="batchDialogVisible" title="批量批改整卷" width="640px" top="8vh">
+      <el-form :inline="true" style="margin-bottom: 12px">
+        <el-form-item label="试卷">
+          <el-select v-model="batchForm.exam_id" placeholder="选择试卷" filterable style="width: 320px" @change="loadBatchPreview">
+            <el-option v-for="e in exams" :key="e.id" :label="e.title" :value="e.id" />
+          </el-select>
+        </el-form-item>
+      </el-form>
+
+      <div v-if="batchPreviewLoaded" style="margin-bottom: 12px">
+        <el-alert
+          :type="batchPreview.ready.length ? 'info' : 'warning'"
+          :closable="false" show-icon
+          :title="`已为该卷录入照片的学生 ${batchPreview.ready.length} 人，可批量批改；无照片 ${batchPreview.noImage.length} 人将跳过`"
+        />
+      </div>
+
+      <div v-if="batchPreviewLoaded && batchPreview.ready.length" class="batch-select-list">
+        <div class="batch-select-head">
+          <el-checkbox v-model="batchSelectAll" @change="onBatchSelectAll">全选</el-checkbox>
+          <span class="form-tip">勾选要批改的学生（默认全选）</span>
+        </div>
+        <el-checkbox-group v-model="batchSelectedIds">
+          <el-checkbox v-for="s in batchPreview.ready" :key="s.student_id" :value="s.student_id" class="batch-stu">
+            {{ s.student_name }}
+          </el-checkbox>
+        </el-checkbox-group>
+      </div>
+      <div v-else-if="batchPreviewLoaded" class="form-tip">
+        该试卷下没有已录入照片的学生。请先在「试卷管理 → 考试记录」里为学生上传试卷照片。
+      </div>
+
+      <div v-if="batchPreviewLoaded && batchPreview.noImage.length" style="margin-top: 12px">
+        <div class="form-tip" style="margin-bottom: 4px">以下学生无试卷照片，将被跳过（可关闭此弹窗去补照片）：</div>
+        <div class="batch-noimg">
+          <el-tag v-for="s in batchPreview.noImage" :key="s.student_id" size="small" type="info" style="margin: 2px">{{ s.student_name }}</el-tag>
+        </div>
+      </div>
+
+      <template #footer>
+        <el-button @click="batchDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="batching" :disabled="!batchSelectedIds.length" @click="confirmBatch">
+          批量批改（{{ batchSelectedIds.length }} 人）
+        </el-button>
+      </template>
+    </el-dialog>
+
     <!-- 模型配置对话框：总开关 + 多供应商管理 -->
     <el-dialog v-model="configVisible" title="AI 模型配置" width="760px" top="6vh">
       <div class="cfg-enabled">
@@ -579,8 +653,8 @@ import { ElMessage } from 'element-plus'
 import {
   getAiPresets, getAiConfig, saveAiConfig, testAiConnection,
   addAiProvider, updateAiProvider, deleteAiProvider, activateAiProvider, testAiProvider,
-  getAiTasks, createAiTask, getAiTask, adoptAiTask, editAiTaskResult, deleteAiTask, exportAiTask,
-  getExams, getStudents, getExamAnswerRef, saveExamAnswerRef
+  getAiTasks, createAiTask, createAiBatchTask, getAiTask, adoptAiTask, editAiTaskResult, deleteAiTask, exportAiTask,
+  getExams, getStudents, getExamAnswerRef, saveExamAnswerRef, getExamRecords
 } from '../../api'
 
 // ---------- 状态 ----------
@@ -790,6 +864,96 @@ const startGrading = async () => {
     starting.value = false
   }
 }
+
+// ---------- 批量批改 ----------
+const batchDialogVisible = ref(false)
+const batching = ref(false)
+const batchForm = ref({ exam_id: null })
+const batchPreviewLoaded = ref(false)
+const batchPreview = ref({ ready: [], noImage: [] }) // ready: {student_id, student_name}[]; noImage 同理
+const batchSelectedIds = ref([])
+const batchSelectAll = ref(true)
+const batchVisible = ref(false)          // 进度面板是否显示
+const batchExamTitle = ref('')
+const batchTaskIds = ref([])             // 本次批量创建的任务 id 集合（用于进度统计，刷新后按 exam 兜底）
+
+// 打开批量预检：先选试卷，再拉该卷考试记录判断哪些学生有照片
+const openBatch = () => {
+  batchForm.value.exam_id = newForm.value.exam_id || null
+  batchPreviewLoaded.value = false
+  batchPreview.value = { ready: [], noImage: [] }
+  batchSelectedIds.value = []
+  batchDialogVisible.value = true
+  if (batchForm.value.exam_id) loadBatchPreview()
+}
+const loadBatchPreview = async () => {
+  const examId = batchForm.value.exam_id
+  batchPreviewLoaded.value = false
+  if (!examId) return
+  try {
+    const records = await getExamRecords(examId)
+    const ready = []
+    const noImage = []
+    for (const r of (records || [])) {
+      const hasImg = !!(r.image_path && r.image_path.trim())
+      const item = { student_id: r.student_id, student_name: r.student_name || `学生${r.student_id}` }
+      if (hasImg) ready.push(item)
+      else noImage.push(item)
+    }
+    batchPreview.value = { ready, noImage }
+    batchSelectedIds.value = ready.map(s => s.student_id)
+    batchSelectAll.value = true
+    batchPreviewLoaded.value = true
+  } catch (e) {
+    // 拦截器已提示
+  }
+}
+const onBatchSelectAll = (val) => {
+  batchSelectedIds.value = val ? batchPreview.value.ready.map(s => s.student_id) : []
+}
+const confirmBatch = async () => {
+  if (!batchForm.value.exam_id) return ElMessage.warning('请选择试卷')
+  if (!batchSelectedIds.value.length) return ElMessage.warning('请至少勾选一名学生')
+  batching.value = true
+  try {
+    const r = await createAiBatchTask({ exam_id: batchForm.value.exam_id, student_ids: batchSelectedIds.value })
+    batchDialogVisible.value = false
+    const exam = exams.value.find(e => e.id === batchForm.value.exam_id)
+    batchExamTitle.value = exam ? exam.title : ''
+    batchTaskIds.value = r.task_ids || []
+    batchVisible.value = true
+    // 组装提示
+    const parts = [`已发起 ${r.created} 份批改`]
+    if (r.skipped_no_image && r.skipped_no_image.length) parts.push(`${r.skipped_no_image.length} 人无照片已跳过`)
+    if (r.skipped_running && r.skipped_running.length) parts.push(`${r.skipped_running.length} 人已在批改中`)
+    ElMessage.success(parts.join('，'))
+    await loadTasks()
+    startPolling()
+  } catch (e) {
+    // 拦截器已提示
+  } finally {
+    batching.value = false
+  }
+}
+const closeBatch = () => {
+  batchVisible.value = false
+  batchTaskIds.value = []
+}
+// 整卷进度统计：优先按本次批量创建的 task_ids 过滤，否则按当前试卷过滤
+const batchProgress = computed(() => {
+  let list = tasks.value
+  if (batchTaskIds.value.length) {
+    const set = new Set(batchTaskIds.value)
+    list = tasks.value.filter(t => set.has(t.id))
+  }
+  const total = list.length
+  const done = list.filter(t => t.status === 'success').length
+  const failed = list.filter(t => t.status === 'failed').length
+  const running = list.filter(t => t.status === 'processing' || t.status === 'pending').length
+  const pending = Math.max(0, total - done - failed - running)
+  const percent = total > 0 ? Math.round(((done + failed) / total) * 100) : 0
+  return { total, done, failed, running, pending, percent }
+})
 
 // ---------- 任务列表与轮询 ----------
 const notified = new Set()
@@ -1260,6 +1424,13 @@ onBeforeUnmount(() => {
 .start-form { margin-bottom: 4px; }
 .answer-block { border: 1px solid #ebeef5; border-radius: 6px; padding: 10px 12px; background: #fafafa; margin-top: 12px; }
 .answer-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.batch-panel { border: 1px solid #ebeef5; border-radius: 6px; padding: 12px; background: #f7faf7; margin-top: 14px; }
+.batch-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.batch-stat { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+.batch-select-list { border: 1px solid #ebeef5; border-radius: 6px; padding: 10px 12px; background: #fafafa; }
+.batch-select-head { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+.batch-stu { margin: 4px 12px 4px 0; }
+.batch-noimg { display: flex; flex-wrap: wrap; gap: 2px; }
 .form-tip { font-size: 12px; color: #909399; margin-top: 6px; line-height: 1.6; }
 .text-muted { color: #c0c4cc; }
 .full { color: #909399; font-size: 12px; }

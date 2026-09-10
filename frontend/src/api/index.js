@@ -174,6 +174,8 @@ export const testAiProvider = (id) => request.post(`/ai-grading/providers/${id}/
 export const getAiTasks = (params) => request.get('/ai-grading/tasks', { params })
 export const createAiTask = (formData) =>
   request.post('/ai-grading/tasks', formData, { headers: { 'Content-Type': 'multipart/form-data' } })
+// 批量批改：一次为某试卷下「已有照片」的学生全部发起批改（无照片/已在跑的学生自动跳过）
+export const createAiBatchTask = (data) => request.post('/ai-grading/tasks/batch', data)
 export const getAiTask = (id) => request.get(`/ai-grading/tasks/${id}`)
 export const adoptAiTask = (id, data) => request.post(`/ai-grading/tasks/${id}/adopt`, data)
 export const editAiTaskResult = (id, data) => request.put(`/ai-grading/tasks/${id}/result`, data)
